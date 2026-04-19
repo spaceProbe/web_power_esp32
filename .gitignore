@@ -1,0 +1,9 @@
+# Ignore build artifacts
+build/
+bin/
+*.hex
+*.elf
+
+# Ignore local IDE settings
+.vscode/
+.DS_Store
