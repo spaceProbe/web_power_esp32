@@ -79,6 +79,10 @@ int pwmLow = 50;
 int pwmMed = 150;
 int pwmHigh = 255;
 
+// Animation Tuning
+int animPwm = 255;
+int animSpeed = 10;
+
 // --- Web Server Setup ---
 WiFiServer server(80);
 String header;
@@ -175,6 +179,8 @@ void loadSettings() {
   pwmHigh = preferences.getInt("pwm_high", 255);
   batDischarged = preferences.getFloat("bat_dis", 12.2);
   batCharged = preferences.getFloat("bat_chg", 13.0);
+  animPwm = preferences.getInt("anim_pwm", 255);
+  animSpeed = preferences.getInt("anim_speed", 10);
   preferences.end();
 }
 
@@ -191,6 +197,8 @@ void saveSettings() {
   preferences.putInt("pwm_high", pwmHigh);
   preferences.putFloat("bat_dis", batDischarged);
   preferences.putFloat("bat_chg", batCharged);
+  preferences.putInt("anim_pwm", animPwm);
+  preferences.putInt("anim_speed", animSpeed);
   preferences.end();
 }
 
@@ -233,8 +241,9 @@ void triggerManualOverride() {
 
 void playWifiConnectSequence() {
   for (int pulse = 0; pulse < 2; pulse++) {
-    for (int i = 0; i <= pwmHigh; i += 15) { analogWrite(pwmPin, i); delay(10); }
-    for (int i = pwmHigh; i >= 0; i -= 15) { analogWrite(pwmPin, i); delay(10); }
+    for (int i = 0; i <= animPwm; i += 15) { analogWrite(pwmPin, i); delay(animSpeed); }
+    analogWrite(pwmPin, animPwm); // Guarantee peak
+    for (int i = animPwm; i >= 0; i -= 15) { analogWrite(pwmPin, i); delay(animSpeed); }
     analogWrite(pwmPin, 0); delay(100); 
   }
   delay(200); 
@@ -548,7 +557,9 @@ void loop() {
               int p3Start = header.indexOf("&p3=") + 4; int p3End = header.indexOf("&p4=", p3Start);
               int p4Start = header.indexOf("&p4=") + 4; int p4End = header.indexOf("&bd=", p4Start);
               int bdStart = header.indexOf("&bd=") + 4; int bdEnd = header.indexOf("&bc=", bdStart);
-              int bcStart = header.indexOf("&bc=") + 4; int bcEnd = header.indexOf(" HTTP", bcStart);
+              int bcStart = header.indexOf("&bc=") + 4; int bcEnd = header.indexOf("&ap=", bcStart);
+              int apStart = header.indexOf("&ap=") + 4; int apEnd = header.indexOf("&as=", apStart);
+              int asStart = header.indexOf("&as=") + 4; int asEnd = header.indexOf(" HTTP", asStart);
               
               sysName = urldecode(header.substring(nStart, nEnd));
               pageTitle = urldecode(header.substring(tStart, tEnd));
@@ -559,6 +570,8 @@ void loop() {
               pwmHigh = header.substring(p4Start, p4End).toInt();
               batDischarged = header.substring(bdStart, bdEnd).toFloat();
               batCharged = header.substring(bcStart, bcEnd).toFloat();
+              animPwm = header.substring(apStart, apEnd).toInt();
+              animSpeed = header.substring(asStart, asEnd).toInt();
               
               saveSettings();
               setupOTA(); 
@@ -933,7 +946,7 @@ void loop() {
     ul { list-style-type: none; padding: 0; }
     .card { background: #1e1e1e; padding: 15px; margin: 15px auto; border-radius: 10px; max-width: 350px; }
     .row { display: flex; justify-content: space-between; align-items: center; margin: 10px 25px; }
-    .row input[type='number'] { width: 60px; text-align: center; }
+    .row input[type='number'] { width: 70px; text-align: center; }
   </style>
   <script>
     function addNetwork() { 
@@ -949,8 +962,9 @@ void loop() {
       let p1 = document.getElementById('p1').value; let p2 = document.getElementById('p2').value;
       let p3 = document.getElementById('p3').value; let p4 = document.getElementById('p4').value;
       let bd = document.getElementById('batdis').value; let bc = document.getElementById('batchg').value;
+      let ap = document.getElementById('animpwm').value; let as = document.getElementById('animspd').value;
       document.getElementById('sys-status').innerText = 'Saving...';
-      fetch('/update_sys?n=' + n + '&t=' + t + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc)
+      fetch('/update_sys?n=' + n + '&t=' + t + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as)
         .then(res => res.json()).then(data => { document.getElementById('sys-status').innerText = 'Saved!'; setTimeout(()=>location.reload(), 500); });
     }
   </script>
@@ -975,6 +989,12 @@ void loop() {
     <div class='row'><span>LOW:</span><input type='number' id='p2' value="%P2%" min="0" max="255"></div>
     <div class='row'><span>MED:</span><input type='number' id='p3' value="%P3%" min="0" max="255"></div>
     <div class='row'><span>HIGH:</span><input type='number' id='p4' value="%P4%" min="0" max="255"></div>
+    
+    <hr style="border: 0; height: 1px; background-color: #555; margin: 15px 0;">
+    <p style="margin-bottom:5px;">Animation Tuning</p>
+    <div class='row'><span>Peak Power (0-255):</span><input type='number' id='animpwm' value="%ANIM_PWM%" min="0" max="255"></div>
+    <div class='row'><span>Speed (ms per step):</span><input type='number' id='animspd' value="%ANIM_SPD%" min="1" max="255"></div>
+    
     <button class='btn' onclick='updateSys()' style='margin-top:10px;'>Save Configuration</button>
     <p id='sys-status' style='color:#4CAF50; font-size:14px; margin-bottom:0;'></p>
   </div>
@@ -1002,6 +1022,8 @@ void loop() {
               settingsTemplate.replace("%P2%", String(pwmLow));
               settingsTemplate.replace("%P3%", String(pwmMed));
               settingsTemplate.replace("%P4%", String(pwmHigh));
+              settingsTemplate.replace("%ANIM_PWM%", String(animPwm));
+              settingsTemplate.replace("%ANIM_SPD%", String(animSpeed));
               settingsTemplate.replace("%NW_LIST%", networkListHTML);
               client.print(settingsTemplate);
             } 
