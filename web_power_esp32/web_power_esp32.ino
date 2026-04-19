@@ -1,4 +1,4 @@
-// Wifi and OTA setup
+// Wifi, OTA, and MQTT setup
 #include <WiFi.h>
 #include <Preferences.h>
 #include <vector>
@@ -6,6 +6,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <time.h> 
+#include <PubSubClient.h> // REQUIRED: Install "PubSubClient" by Nick O'Leary
 
 // I2C Reading
 #include <Wire.h>
@@ -19,13 +20,19 @@ Adafruit_ADS1115 ads;
 const float maxVoltage = 3.5;
 const float refVoltage = 3.3;
 
-// --- Wi-Fi Reconnection Timer Variables ---
+// --- Wi-Fi & MQTT Variables ---
 unsigned long previousWifiMillis = 0; 
 const long wifiInterval = 12000; 
 bool wifiWasConnected = false;   
 int currentWifiIndex = -1;
 int attemptsInCurrentCycle = 0;  
 bool apActive = false;           
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+unsigned long lastMqttReconnectAttempt = 0;
+unsigned long lastMqttSyncMillis = 0;
+bool mqttNeedsSync = false;
 
 // --- Saved Networks Structure ---
 struct WiFiCred {
@@ -51,11 +58,11 @@ const long adcInterval = 5000;
 float currentBatteryPercentage = 0.0;
 float currentBatteryVoltage = 0.0; 
 
-// --- Schedule & Smart Mode Variables ---
+// --- Schedule Variables ---
 struct SchedEvent {
   uint8_t h;
   uint8_t m;
-  uint8_t action; // 0=OFF, 1=MIN, 2=LOW, 3=MED, 4=HIGH, 5=SMART
+  uint8_t action; 
 };
 std::vector<SchedEvent> schedule;
 bool scheduleEnabled = false;
@@ -69,6 +76,13 @@ String pageTitle = "Wireless Control";
 String otaPassword = "admin";
 bool batteryEnabled = true;
 bool smartModeActive = false;
+
+// MQTT Config
+bool mqttEnabled = false;
+String mqttServer = "";
+int mqttPort = 1883;
+String mqttUser = "";
+String mqttPass = "";
 
 // Battery Tuning
 float batDischarged = 12.2;
@@ -117,26 +131,32 @@ String urldecode(String str) {
   String decoded = "";
   for (int i = 0; i < str.length(); i++) {
     if (str[i] == '%') {
-      if (i + 2 < str.length()) {
-        decoded += (char)((h2int(str[i+1]) << 4) | h2int(str[i+2]));
-        i += 2;
-      }
-    } else if (str[i] == '+') { decoded += ' '; } 
-    else { decoded += str[i]; }
+      if (i + 2 < str.length()) { decoded += (char)((h2int(str[i+1]) << 4) | h2int(str[i+2])); i += 2; }
+    } else if (str[i] == '+') { decoded += ' '; } else { decoded += str[i]; }
   }
   return decoded;
 }
 
 String getActionName(int a) {
   switch(a) {
-    case 0: return "Turn OFF";
-    case 1: return "Power: MIN";
-    case 2: return "Power: LOW";
-    case 3: return "Power: MED";
-    case 4: return "Power: HIGH";
-    case 5: return "Battery Smart Mode";
+    case 0: return "Turn OFF"; case 1: return "Power: MIN"; case 2: return "Power: LOW";
+    case 3: return "Power: MED"; case 4: return "Power: HIGH"; case 5: return "Battery Smart Mode";
     default: return "Unknown";
   }
+}
+
+String getMacSlug() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  mac.toLowerCase();
+  return mac;
+}
+
+String getBaseTopic() {
+  String base = sysName;
+  base.toLowerCase();
+  base.replace(" ", "-");
+  return base;
 }
 
 // --- NVS Storage Functions ---
@@ -145,10 +165,8 @@ void loadNetworks() {
   preferences.begin("wifi_creds", true); 
   int count = preferences.getInt("count", 0);
   for (int i = 0; i < count; i++) {
-    String sKey = "s_" + String(i);
-    String pKey = "p_" + String(i);
-    String s = preferences.getString(sKey.c_str(), "");
-    String p = preferences.getString(pKey.c_str(), "");
+    String sKey = "s_" + String(i); String pKey = "p_" + String(i);
+    String s = preferences.getString(sKey.c_str(), ""); String p = preferences.getString(pKey.c_str(), "");
     if (s != "") savedNetworks.push_back({s, p});
   }
   preferences.end();
@@ -159,10 +177,8 @@ void saveNetworks() {
   preferences.clear(); 
   preferences.putInt("count", savedNetworks.size());
   for (int i = 0; i < savedNetworks.size(); i++) {
-    String sKey = "s_" + String(i);
-    String pKey = "p_" + String(i);
-    preferences.putString(sKey.c_str(), savedNetworks[i].ssid);
-    preferences.putString(pKey.c_str(), savedNetworks[i].pass);
+    String sKey = "s_" + String(i); String pKey = "p_" + String(i);
+    preferences.putString(sKey.c_str(), savedNetworks[i].ssid); preferences.putString(pKey.c_str(), savedNetworks[i].pass);
   }
   preferences.end();
 }
@@ -183,6 +199,12 @@ void loadSettings() {
   batCharged = preferences.getFloat("bat_chg", 13.0);
   animPwm = preferences.getInt("anim_pwm", 255);
   animSpeed = preferences.getInt("anim_speed", 10);
+  
+  mqttEnabled = preferences.getBool("mqtt_en", false);
+  mqttServer = preferences.getString("mqtt_srv", "");
+  mqttPort = preferences.getInt("mqtt_prt", 1883);
+  mqttUser = preferences.getString("mqtt_usr", "");
+  mqttPass = preferences.getString("mqtt_pwd", "");
   preferences.end();
 }
 
@@ -202,6 +224,12 @@ void saveSettings() {
   preferences.putFloat("bat_chg", batCharged);
   preferences.putInt("anim_pwm", animPwm);
   preferences.putInt("anim_speed", animSpeed);
+  
+  preferences.putBool("mqtt_en", mqttEnabled);
+  preferences.putString("mqtt_srv", mqttServer);
+  preferences.putInt("mqtt_prt", mqttPort);
+  preferences.putString("mqtt_usr", mqttUser);
+  preferences.putString("mqtt_pwd", mqttPass);
   preferences.end();
 }
 
@@ -221,6 +249,117 @@ void saveSchedule() {
   preferences.end();
 }
 
+// --- MQTT & State Synchronization ---
+void syncState() {
+  mqttNeedsSync = true;
+  printNow = 1;
+}
+
+void publishMqttState() {
+  if (!mqttClient.connected()) return;
+  String base = getBaseTopic();
+  
+  String pwrStr = (powerState == 0 && currentPWM == 0) ? "OFF" : "ON";
+  mqttClient.publish(String(base + "/power/state").c_str(), pwrStr.c_str(), false);
+  mqttClient.publish(String(base + "/pwm/state").c_str(), String(currentPWM).c_str(), false);
+  
+  String smartStr = smartModeActive ? "ON" : "OFF";
+  mqttClient.publish(String(base + "/smart/state").c_str(), smartStr.c_str(), false);
+
+  if (batteryEnabled) {
+    mqttClient.publish(String(base + "/battery").c_str(), String((int)currentBatteryPercentage).c_str(), false);
+    mqttClient.publish(String(base + "/voltage").c_str(), String(currentBatteryVoltage, 2).c_str(), false);
+  }
+}
+
+void publishAutoDiscovery() {
+  String base = getBaseTopic();
+  String mac = getMacSlug();
+  
+  // 1. Light Entity
+  String lightTopic = "homeassistant/light/" + mac + "/config";
+  String lightPayload = "{\"name\":\"Power\",\"uniq_id\":\"" + mac + "_light\",\"stat_t\":\"" + base + "/power/state\",\"cmd_t\":\"" + base + "/power/set\",\"bri_stat_t\":\"" + base + "/pwm/state\",\"bri_cmd_t\":\"" + base + "/pwm/set\",\"bri_scl\":255,\"dev\":{\"ids\":\"" + mac + "\",\"name\":\"" + sysName + "\",\"mf\":\"Custom\"}}";
+  mqttClient.publish(lightTopic.c_str(), lightPayload.c_str(), true);
+
+  // 2. Smart Mode Switch
+  String smartTopic = "homeassistant/switch/" + mac + "_smart/config";
+  String smartPayload = "{\"name\":\"Smart Mode\",\"uniq_id\":\"" + mac + "_smart\",\"stat_t\":\"" + base + "/smart/state\",\"cmd_t\":\"" + base + "/smart/set\",\"ic\":\"mdi:brain\",\"dev\":{\"ids\":\"" + mac + "\"}}";
+  mqttClient.publish(smartTopic.c_str(), smartPayload.c_str(), true);
+
+  // 3. Battery Sensors
+  if (batteryEnabled) {
+    String batTopic = "homeassistant/sensor/" + mac + "_bat/config";
+    String batPayload = "{\"name\":\"Battery\",\"uniq_id\":\"" + mac + "_bat\",\"stat_t\":\"" + base + "/battery\",\"unit_of_meas\":\"%\",\"dev_cla\":\"battery\",\"stat_cla\":\"measurement\",\"dev\":{\"ids\":\"" + mac + "\"}}";
+    mqttClient.publish(batTopic.c_str(), batPayload.c_str(), true);
+
+    String volTopic = "homeassistant/sensor/" + mac + "_vol/config";
+    String volPayload = "{\"name\":\"Voltage\",\"uniq_id\":\"" + mac + "_vol\",\"stat_t\":\"" + base + "/voltage\",\"unit_of_meas\":\"V\",\"dev_cla\":\"voltage\",\"stat_cla\":\"measurement\",\"dev\":{\"ids\":\"" + mac + "\"}}";
+    mqttClient.publish(volTopic.c_str(), volPayload.c_str(), true);
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  String p = "";
+  for (int i = 0; i < length; i++) { p += (char)payload[i]; }
+  
+  String base = getBaseTopic();
+  
+  if (t == base + "/power/set") {
+    scheduleOverride = true;
+    if (p == "ON") { powerState = lastPowerState; pwmOveride = 0; } 
+    else { powerState = 0; pwmOveride = 0; }
+    if (smartModeActive) { smartModeActive = false; saveSettings(); }
+  } 
+  else if (t == base + "/pwm/set") {
+    scheduleOverride = true;
+    int val = p.toInt();
+    if (val < 0) val = 0; if (val > 255) val = 255;
+    if (val == 0) { powerState = 0; pwmOveride = 0; } else { currentPWM = val; pwmOveride = 1; }
+    if (smartModeActive) { smartModeActive = false; saveSettings(); }
+  } 
+  else if (t == base + "/smart/set") {
+    if (batteryEnabled) {
+      if (p == "ON") { smartModeActive = true; scheduleOverride = false; } 
+      else { smartModeActive = false; }
+      saveSettings();
+    }
+  }
+  
+  applyPowerState();
+  syncState();
+}
+
+void handleMQTT() {
+  if (!mqttEnabled || mqttServer == "" || WiFi.status() != WL_CONNECTED) return;
+
+  if (!mqttClient.connected()) {
+    unsigned long now = millis();
+    if (now - lastMqttReconnectAttempt > 5000) {
+      lastMqttReconnectAttempt = now;
+      Serial.print("Attempting MQTT connection...");
+      String clientId = getBaseTopic() + "-" + String(random(0xffff), HEX);
+      
+      bool connected = false;
+      if (mqttUser != "") connected = mqttClient.connect(clientId.c_str(), mqttUser.c_str(), mqttPass.c_str());
+      else connected = mqttClient.connect(clientId.c_str());
+
+      if (connected) {
+        Serial.println("connected.");
+        publishAutoDiscovery();
+        mqttClient.subscribe(String(getBaseTopic() + "/power/set").c_str());
+        mqttClient.subscribe(String(getBaseTopic() + "/pwm/set").c_str());
+        mqttClient.subscribe(String(getBaseTopic() + "/smart/set").c_str());
+        syncState(); // Publish immediate state on fresh connection
+      } else {
+        Serial.print("failed, rc="); Serial.println(mqttClient.state());
+      }
+    }
+  } else {
+    mqttClient.loop();
+  }
+}
+
 // --- Device Control Logic ---
 void applyPowerState() {
   if (pwmOveride == 0) {
@@ -229,17 +368,15 @@ void applyPowerState() {
     else if (powerState == 3) currentPWM = pwmMed;
     else if (powerState == 4) currentPWM = pwmHigh;
     else currentPWM = 0; 
-    analogWrite(pwmPin, currentPWM);
   }
+  analogWrite(pwmPin, currentPWM);
 }
 
 void triggerManualOverride() {
   scheduleOverride = true; 
-  if (smartModeActive) {
-    smartModeActive = false;
-    saveSettings();
-  }
+  if (smartModeActive) { smartModeActive = false; saveSettings(); }
   Serial.println("Manual override triggered.");
+  syncState();
 }
 
 void playWifiConnectSequence() {
@@ -254,45 +391,9 @@ void playWifiConnectSequence() {
   analogWrite(pwmPin, currentPWM); 
 }
 
-// --- Morse Code Helpers ---
-String digitToMorse(char digit) {
-  switch (digit) {
-    case '0': return "-----"; case '1': return ".----"; case '2': return "..---";
-    case '3': return "...--"; case '4': return "....-"; case '5': return ".....";
-    case '6': return "-...."; case '7': return "--..."; case '8': return "---..";
-    case '9': return "----."; default: return "";
-  }
-}
-
-void blinkMorse(String morseStr) {
-  int dotDuration = 200; 
-  analogWrite(pwmPin, 0);
-  delay(dotDuration);
-  for (int i = 0; i < morseStr.length(); i++) {
-    if (morseStr[i] == '.') { analogWrite(pwmPin, pwmMed); delay(dotDuration); } 
-    else if (morseStr[i] == '-') { analogWrite(pwmPin, pwmMed); delay(dotDuration * 3); }
-    analogWrite(pwmPin, 0); delay(dotDuration); 
-  }
-}
-
-void playIPMorse() {
-  IPAddress ip = WiFi.localIP();
-  String lastOctet = String(ip[3]);
-  delay(2000); 
-  for (int i = 0; i < lastOctet.length(); i++) {
-    blinkMorse(digitToMorse(lastOctet[i]));
-    if (i < lastOctet.length() - 1) delay(1000); 
-  }
-  for (int i = 0; i <= currentPWM; i += 5) { analogWrite(pwmPin, i); delay(15); }
-  analogWrite(pwmPin, currentPWM);
-}
-
 // --- OTA Setup ---
 void setupOTA() {
-  String host = sysName;
-  host.toLowerCase();
-  host.replace(" ", "-");
-  ArduinoOTA.setHostname(host.c_str());
+  ArduinoOTA.setHostname(getBaseTopic().c_str());
   ArduinoOTA.setPassword(otaPassword.c_str()); 
   ArduinoOTA.onStart([]() { Serial.println("Start updating"); });
   ArduinoOTA.onEnd([]() { Serial.println("\nEnd"); });
@@ -304,8 +405,7 @@ void setupOTA() {
 bool stringParse(String data, std::vector<BatteryLogEntry>& logs) {
   if (data == "") return false;
   logs.clear();
-  int start = 0;
-  int end = data.indexOf(';');
+  int start = 0; int end = data.indexOf(';');
   while (end != -1) {
     String segment = data.substring(start, end);
     int comma = segment.indexOf(',');
@@ -314,15 +414,13 @@ bool stringParse(String data, std::vector<BatteryLogEntry>& logs) {
       float p = segment.substring(comma + 1).toFloat();
       logs.push_back({ts, p});
     }
-    start = end + 1;
-    end = data.indexOf(';', start);
+    start = end + 1; end = data.indexOf(';', start);
   }
   return true;
 }
 
 void addBatteryLog(float percentage) {
-  time_t now;
-  time(&now); 
+  time_t now; time(&now); 
   shortTermLogs.push_back({now, percentage});
   while (shortTermLogs.size() > MAX_LOGS) { shortTermLogs.erase(shortTermLogs.begin()); }
 }
@@ -330,9 +428,7 @@ void addBatteryLog(float percentage) {
 void saveBatteryLogs() {
   preferences.begin("bat_logs", false);
   String stStr = "";
-  for (auto const& entry : shortTermLogs) {
-    stStr += String((unsigned long)entry.timestamp) + "," + String(entry.percentage) + ";";
-  }
+  for (auto const& entry : shortTermLogs) { stStr += String((unsigned long)entry.timestamp) + "," + String(entry.percentage) + ";"; }
   preferences.putString("st_logs", stStr);
   preferences.end();
 }
@@ -358,6 +454,10 @@ void setup() {
   loadNetworks();
   loadSettings();
   loadSchedule();
+  
+  mqttClient.setBufferSize(1024);
+  if (mqttServer != "") mqttClient.setServer(mqttServer.c_str(), mqttPort);
+  mqttClient.setCallback(mqttCallback);
   
   previousWifiMillis = millis() - wifiInterval; 
   
@@ -385,6 +485,8 @@ void loop() {
   ArduinoOTA.handle();
   unsigned long now = millis();
   
+  handleMQTT();
+  
   // 1. Handle Physical Button Input 
   int buttonState = digitalRead(bootButtonPin);
   if (buttonState == LOW && (now - lastButtonMillis > debounceTime)) {
@@ -393,8 +495,9 @@ void loop() {
     powerState++;
     if (powerState > 4) powerState = 0;
     if (powerState != 0) lastPowerState = powerState;
-    pwmOveride = 0; printNow = 1;
+    pwmOveride = 0; 
     applyPowerState();
+    syncState();
   }
 
   // 2. Handle Schedule State Machine
@@ -407,10 +510,8 @@ void loop() {
       
       if (ti->tm_year > 100) { 
         int curMins = ti->tm_hour * 60 + ti->tm_min;
-        int targetAction = -1;
-        int maxMins = -1;
-        int wrapAction = -1;
-        int wrapMins = -1;
+        int targetAction = -1; int maxMins = -1;
+        int wrapAction = -1; int wrapMins = -1;
 
         for(auto& ev : schedule) {
             int evMins = ev.h * 60 + ev.m;
@@ -431,15 +532,15 @@ void loop() {
             if(!batterySafe) {
                 if(powerState != 0 || smartModeActive || pwmOveride != 0) {
                     smartModeActive = false;
-                    powerState = 0; pwmOveride = 0; applyPowerState(); printNow = 1;
+                    powerState = 0; pwmOveride = 0; applyPowerState(); syncState();
                 }
             } else {
                 if(targetAction == 5 && batteryEnabled) {
-                    if(!smartModeActive) { smartModeActive = true; saveSettings(); printNow = 1; }
+                    if(!smartModeActive) { smartModeActive = true; saveSettings(); syncState(); }
                 } else if (targetAction >= 0 && targetAction <= 4) {
                     if(smartModeActive || powerState != targetAction || pwmOveride != 0) {
                         smartModeActive = false;
-                        powerState = targetAction; pwmOveride = 0; applyPowerState(); printNow = 1;
+                        powerState = targetAction; pwmOveride = 0; applyPowerState(); syncState();
                     }
                 }
             }
@@ -459,9 +560,7 @@ void loop() {
       
       if (batCharged > batDischarged) {
         currentBatteryPercentage = ((currentBatteryVoltage - batDischarged) / (batCharged - batDischarged)) * 100.0;
-      } else {
-        currentBatteryPercentage = 0.0;
-      }
+      } else { currentBatteryPercentage = 0.0; }
 
       if (currentBatteryPercentage > 100.0) currentBatteryPercentage = 100.0;
       if (currentBatteryPercentage < 0) currentBatteryPercentage = 0;
@@ -480,10 +579,8 @@ void loop() {
         else desiredState = 0; 
 
         if (powerState != desiredState || pwmOveride != 0) {
-          powerState = desiredState;
-          pwmOveride = 0;
-          applyPowerState();
-          printNow = 1;
+          powerState = desiredState; pwmOveride = 0;
+          applyPowerState(); syncState();
         }
       }
     }
@@ -499,14 +596,24 @@ void loop() {
     }
   }
 
-  // 5. Handle Serial Input
+  // 5. Regular MQTT Sync & Serial
+  if (now - lastMqttSyncMillis >= 300000) { 
+    lastMqttSyncMillis = now;
+    syncState();
+  }
+  
+  if (mqttNeedsSync) {
+    publishMqttState();
+    mqttNeedsSync = false;
+  }
+
   if (Serial.available() > 0) {
     int input = Serial.parseInt();
     while (Serial.available() > 0) Serial.read(); 
     if (input >= 0 && input <= 255) {
       triggerManualOverride();
       pwmOveride = 1; currentPWM = input;
-      analogWrite(pwmPin, currentPWM); printNow = 1;
+      analogWrite(pwmPin, currentPWM); syncState();
     }
   }
 
@@ -518,12 +625,9 @@ void loop() {
       if (savedNetworks.size() > 0) {
         currentWifiIndex++;
         if (currentWifiIndex >= savedNetworks.size()) currentWifiIndex = 0;
-        
         attemptsInCurrentCycle++;
         if (attemptsInCurrentCycle > savedNetworks.size() && !apActive) {
-          WiFi.mode(WIFI_AP_STA);
-          WiFi.softAP("Wireless Control Setup", "password123"); 
-          apActive = true;
+          WiFi.mode(WIFI_AP_STA); WiFi.softAP("Wireless Control Setup", "password123"); apActive = true;
         }
         String trySsid = savedNetworks[currentWifiIndex].ssid;
         String tryPass = savedNetworks[currentWifiIndex].pass;
@@ -531,9 +635,8 @@ void loop() {
       }
     }
   } else if (!wifiWasConnected) {
-    wifiWasConnected = true;
-    attemptsInCurrentCycle = 0;
-    playWifiConnectSequence(); playIPMorse();
+    wifiWasConnected = true; attemptsInCurrentCycle = 0;
+    playWifiConnectSequence(); 
     if (apActive) { WiFi.mode(WIFI_STA); apActive = false; }
   }
 
@@ -563,7 +666,12 @@ void loop() {
               int bdStart = header.indexOf("&bd=") + 4; int bdEnd = header.indexOf("&bc=", bdStart);
               int bcStart = header.indexOf("&bc=") + 4; int bcEnd = header.indexOf("&ap=", bcStart);
               int apStart = header.indexOf("&ap=") + 4; int apEnd = header.indexOf("&as=", apStart);
-              int asStart = header.indexOf("&as=") + 4; int asEnd = header.indexOf(" HTTP", asStart);
+              int asStart = header.indexOf("&as=") + 4; int asEnd = header.indexOf("&me=", asStart);
+              int meStart = header.indexOf("&me=") + 4; int meEnd = header.indexOf("&ms=", meStart);
+              int msStart = header.indexOf("&ms=") + 4; int msEnd = header.indexOf("&mpt=", msStart);
+              int mptStart = header.indexOf("&mpt=") + 5; int mptEnd = header.indexOf("&mu=", mptStart);
+              int muStart = header.indexOf("&mu=") + 4; int muEnd = header.indexOf("&mw=", muStart);
+              int mwStart = header.indexOf("&mw=") + 4; int mwEnd = header.indexOf(" HTTP", mwStart);
               
               sysName = urldecode(header.substring(nStart, nEnd));
               pageTitle = urldecode(header.substring(tStart, tEnd));
@@ -578,16 +686,29 @@ void loop() {
               animPwm = header.substring(apStart, apEnd).toInt();
               animSpeed = header.substring(asStart, asEnd).toInt();
               
-              saveSettings();
-              setupOTA(); 
+              mqttEnabled = header.substring(meStart, meEnd).toInt() == 1;
+              mqttServer = urldecode(header.substring(msStart, msEnd));
+              mqttPort = header.substring(mptStart, mptEnd).toInt();
+              mqttUser = urldecode(header.substring(muStart, muEnd));
+              mqttPass = urldecode(header.substring(mwStart, mwEnd));
+              
+              saveSettings(); setupOTA(); 
+              if (mqttServer != "") mqttClient.setServer(mqttServer.c_str(), mqttPort);
+              if (mqttClient.connected()) mqttClient.disconnect(); 
+              lastMqttReconnectAttempt = 0; // Force immediate reconnect attempt
+              
               client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}");
+            }
+            // LIVE STATUS POLLING API
+            else if (header.indexOf("GET /status HTTP") >= 0) {
+              String mqttStr = mqttClient.connected() ? "true" : "false";
+              client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"mqtt\":" + mqttStr + "}");
             }
             // WI-FI MANAGER
             else if (header.indexOf("GET /add_wifi") >= 0) {
               int sStart = header.indexOf("s=") + 2; int sEnd = header.indexOf("&", sStart);
               int pStart = header.indexOf("p=") + 2; int pEnd = header.indexOf(" HTTP", pStart);
-              String newSsid = urldecode(header.substring(sStart, sEnd));
-              String newPass = urldecode(header.substring(pStart, pEnd));
+              String newSsid = urldecode(header.substring(sStart, sEnd)); String newPass = urldecode(header.substring(pStart, pEnd));
               savedNetworks.push_back({newSsid, newPass}); saveNetworks();
               client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}");
               previousWifiMillis = millis() - wifiInterval; 
@@ -657,7 +778,7 @@ void loop() {
                 analogWrite(pwmPin, currentPWM);
               }
               
-              printNow = 1;
+              printNow = 1; syncState();
               String stateStr = (pwmOveride == 1) ? "MANUAL OVERRIDE" : (powerState == 0 ? "OFF" : (powerState == 1 ? "MIN" : (powerState == 2 ? "LOW" : (powerState == 3 ? "MED" : "HIGH"))));
               String smartStr = smartModeActive ? "true" : "false";
               client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"state\":\"" + stateStr + "\", \"pwm\":" + String(currentPWM) + ", \"smart\":" + smartStr + "}");
@@ -676,7 +797,6 @@ void loop() {
               
               String masterBtnClass = scheduleEnabled ? "btn-blue" : "btn-off";
               String masterBtnText = scheduleEnabled ? "Disable Schedule" : "Enable Schedule";
-              
               String batteryBanner = "";
               if (batteryEnabled && currentBatteryPercentage <= 15.0 && scheduleEnabled) {
                   batteryBanner = "<div style='background-color:#FF9800; color:#000; padding:10px; margin-bottom:15px; border-radius:5px; font-weight:bold;'>⚠️ Battery low (" + String((int)currentBatteryPercentage) + "%). Schedule paused until charged.</div>";
@@ -768,156 +888,54 @@ void loop() {
   </div><br>
   <a href='/' class='btn-back'>&#x1F519;&#xFE0E; Back</a>
   <script>
-    let rawData = [];
-    let viewMin = 0, viewMax = 0;
-    const canvas = document.getElementById('batteryChart');
-    const ctx = canvas.getContext('2d');
-
-    function formatTime(ts) {
-        return new Date(ts * 1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-    }
-
+    let rawData = []; let viewMin = 0, viewMax = 0; const canvas = document.getElementById('batteryChart'); const ctx = canvas.getContext('2d');
+    function formatTime(ts) { return new Date(ts * 1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
     function draw() {
-        const w = canvas.width, h = canvas.height;
-        const padX = 50, padY = 20, padB = 40;
-        const gW = w - padX - 10, gH = h - padY - padB;
-
-        ctx.fillStyle = '#1e1e1e'; ctx.fillRect(0,0,w,h);
-        ctx.fillStyle = '#fff'; ctx.font = '14px Helvetica';
-
+        const w = canvas.width, h = canvas.height; const padX = 50, padY = 20, padB = 40; const gW = w - padX - 10, gH = h - padY - padB;
+        ctx.fillStyle = '#1e1e1e'; ctx.fillRect(0,0,w,h); ctx.fillStyle = '#fff'; ctx.font = '14px Helvetica';
         if(!rawData.length){ ctx.textAlign='center'; ctx.fillText('Waiting for logs...', w/2, h/2); return; }
-
-        const dataMin = rawData[0].ts; const dataMax = rawData[rawData.length-1].ts;
-        const minRange = 600; 
+        const dataMin = rawData[0].ts; const dataMax = rawData[rawData.length-1].ts; const minRange = 600; 
         if (viewMax - viewMin < minRange) { let c = (viewMax+viewMin)/2; viewMin = c - minRange/2; viewMax = c + minRange/2; }
-        
         if (viewMin < dataMin) { let d = dataMin - viewMin; viewMin += d; viewMax += d; }
         if (viewMax > dataMax) { let d = viewMax - dataMax; viewMin -= d; viewMax -= d; }
         if (viewMin < dataMin) viewMin = dataMin;
-
         ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
-        for(let p=0; p<=100; p+=25) {
-            let y = padY + gH - (p/100)*gH;
-            ctx.fillText(p+'%', padX-10, y);
-            ctx.strokeStyle = '#333'; ctx.beginPath(); ctx.moveTo(padX, y); ctx.lineTo(padX+gW, y); ctx.stroke();
-        }
-
+        for(let p=0; p<=100; p+=25) { let y = padY + gH - (p/100)*gH; ctx.fillText(p+'%', padX-10, y); ctx.strokeStyle = '#333'; ctx.beginPath(); ctx.moveTo(padX, y); ctx.lineTo(padX+gW, y); ctx.stroke(); }
         ctx.strokeStyle = '#555'; ctx.beginPath(); ctx.moveTo(padX, padY); ctx.lineTo(padX, padY+gH); ctx.lineTo(padX+gW, padY+gH); ctx.stroke();
-
-        let timeRange = viewMax - viewMin;
-        let numTicks = 6;
-        let tickStep = timeRange / numTicks;
+        let timeRange = viewMax - viewMin; let numTicks = 6; let tickStep = timeRange / numTicks;
         ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-        for(let i=0; i<=numTicks; i++) {
-            let t = viewMin + i * tickStep;
-            let x = padX + (t - viewMin)/timeRange * gW;
-            ctx.fillText(formatTime(t), x, padY+gH+10);
-            ctx.beginPath(); ctx.moveTo(x, padY+gH); ctx.lineTo(x, padY+gH+5); ctx.stroke();
-        }
-
-        ctx.save();
-        ctx.beginPath(); ctx.rect(padX, padY, gW, gH); ctx.clip();
-
-        if (rawData.length === 1) {
-            let d = rawData[0];
-            let x = padX + gW/2;
-            let y = padY + gH - (d.p/100.0) * gH;
-            ctx.beginPath(); ctx.arc(x, y, 4, 0, 2*Math.PI); ctx.fillStyle = '#21d8f6'; ctx.fill();
-        } else {
-            ctx.strokeStyle = '#21d8f6'; ctx.lineWidth = 3; ctx.beginPath();
-            let first = true;
+        for(let i=0; i<=numTicks; i++) { let t = viewMin + i * tickStep; let x = padX + (t - viewMin)/timeRange * gW; ctx.fillText(formatTime(t), x, padY+gH+10); ctx.beginPath(); ctx.moveTo(x, padY+gH); ctx.lineTo(x, padY+gH+5); ctx.stroke(); }
+        ctx.save(); ctx.beginPath(); ctx.rect(padX, padY, gW, gH); ctx.clip();
+        if (rawData.length === 1) { let d = rawData[0]; let x = padX + gW/2; let y = padY + gH - (d.p/100.0) * gH; ctx.beginPath(); ctx.arc(x, y, 4, 0, 2*Math.PI); ctx.fillStyle = '#21d8f6'; ctx.fill(); } 
+        else {
+            ctx.strokeStyle = '#21d8f6'; ctx.lineWidth = 3; ctx.beginPath(); let first = true;
             for(let d of rawData) {
                 if(d.ts < viewMin - timeRange*0.1 || d.ts > viewMax + timeRange*0.1) continue; 
-                let x = padX + ((d.ts - viewMin)/timeRange) * gW;
-                let y = padY + gH - (d.p/100.0) * gH;
+                let x = padX + ((d.ts - viewMin)/timeRange) * gW; let y = padY + gH - (d.p/100.0) * gH;
                 if(first) { ctx.moveTo(x, y); first = false; } else { ctx.lineTo(x, y); }
             }
-            ctx.stroke();
-            ctx.lineTo(padX + gW, padY + gH); ctx.lineTo(padX, padY + gH);
-            ctx.fillStyle = 'rgba(33, 216, 246, 0.1)'; ctx.fill();
+            ctx.stroke(); ctx.lineTo(padX + gW, padY + gH); ctx.lineTo(padX, padY + gH); ctx.fillStyle = 'rgba(33, 216, 246, 0.1)'; ctx.fill();
         }
         ctx.restore();
     }
-
     let isDragging = false; let lastX = 0; let lastDist = 0;
-
-    function getX(e) {
-        if(e.touches && e.touches.length > 0) {
-            let rect = canvas.getBoundingClientRect();
-            return (e.touches[0].clientX - rect.left) * (canvas.width / rect.width);
-        }
-        return e.offsetX * (canvas.width / canvas.offsetWidth);
-    }
-
-    function getDist(e) {
-        if(e.touches && e.touches.length === 2) {
-            let dx = e.touches[0].clientX - e.touches[1].clientX;
-            let dy = e.touches[0].clientY - e.touches[1].clientY;
-            return Math.sqrt(dx*dx + dy*dy);
-        }
-        return 0;
-    }
-
+    function getX(e) { if(e.touches && e.touches.length > 0) { let rect = canvas.getBoundingClientRect(); return (e.touches[0].clientX - rect.left) * (canvas.width / rect.width); } return e.offsetX * (canvas.width / canvas.offsetWidth); }
+    function getDist(e) { if(e.touches && e.touches.length === 2) { let dx = e.touches[0].clientX - e.touches[1].clientX; let dy = e.touches[0].clientY - e.touches[1].clientY; return Math.sqrt(dx*dx + dy*dy); } return 0; }
     canvas.addEventListener('mousedown', e => { isDragging = true; lastX = getX(e); });
-    canvas.addEventListener('mousemove', e => {
-        if(!isDragging) return;
-        let x = getX(e); let dx = x - lastX;
-        let dt = (dx / (canvas.width - 60)) * (viewMax - viewMin);
-        viewMin -= dt; viewMax -= dt; lastX = x; draw();
-    });
-    canvas.addEventListener('mouseup', () => isDragging = false);
-    canvas.addEventListener('mouseleave', () => isDragging = false);
-
-    canvas.addEventListener('touchstart', e => {
-        if(e.touches.length === 1) { isDragging = true; lastX = getX(e); }
-        if(e.touches.length === 2) { isDragging = false; lastDist = getDist(e); }
-    });
+    canvas.addEventListener('mousemove', e => { if(!isDragging) return; let x = getX(e); let dx = x - lastX; let dt = (dx / (canvas.width - 60)) * (viewMax - viewMin); viewMin -= dt; viewMax -= dt; lastX = x; draw(); });
+    canvas.addEventListener('mouseup', () => isDragging = false); canvas.addEventListener('mouseleave', () => isDragging = false);
+    canvas.addEventListener('touchstart', e => { if(e.touches.length === 1) { isDragging = true; lastX = getX(e); } if(e.touches.length === 2) { isDragging = false; lastDist = getDist(e); } });
     canvas.addEventListener('touchmove', e => {
         e.preventDefault();
-        if(e.touches.length === 1 && isDragging) {
-            let x = getX(e); let dx = x - lastX;
-            let dt = (dx / (canvas.width - 60)) * (viewMax - viewMin);
-            viewMin -= dt; viewMax -= dt; lastX = x; draw();
-        }
-        if(e.touches.length === 2) {
-            let dist = getDist(e); let zoom = lastDist / dist;
-            zoomCenter(1.0, zoom); 
-            lastDist = dist;
-        }
+        if(e.touches.length === 1 && isDragging) { let x = getX(e); let dx = x - lastX; let dt = (dx / (canvas.width - 60)) * (viewMax - viewMin); viewMin -= dt; viewMax -= dt; lastX = x; draw(); }
+        if(e.touches.length === 2) { let dist = getDist(e); let zoom = lastDist / dist; zoomCenter(1.0, zoom); lastDist = dist; }
     }, {passive: false});
     canvas.addEventListener('touchend', () => isDragging = false);
-
-    canvas.addEventListener('wheel', e => {
-        e.preventDefault();
-        let rect = canvas.getBoundingClientRect(); let x = e.clientX - rect.left;
-        let pct = (x - 50) / (rect.width - 60);
-        if(pct < 0) pct = 0; if(pct > 1) pct = 1;
-        zoomCenter(pct, e.deltaY > 0 ? 1.2 : 0.8);
-    }, {passive: false});
-
-    function zoomCenter(pct, factor) {
-        let range = viewMax - viewMin; let tCenter = viewMin + pct * range; let newRange = range * factor;
-        viewMin = tCenter - pct * newRange; viewMax = tCenter + (1 - pct) * newRange; draw();
-    }
-
+    canvas.addEventListener('wheel', e => { e.preventDefault(); let rect = canvas.getBoundingClientRect(); let x = e.clientX - rect.left; let pct = (x - 50) / (rect.width - 60); if(pct < 0) pct = 0; if(pct > 1) pct = 1; zoomCenter(pct, e.deltaY > 0 ? 1.2 : 0.8); }, {passive: false});
+    function zoomCenter(pct, factor) { let range = viewMax - viewMin; let tCenter = viewMin + pct * range; let newRange = range * factor; viewMin = tCenter - pct * newRange; viewMax = tCenter + (1 - pct) * newRange; draw(); }
     function zoomBtn(factor) { zoomCenter(1.0, factor); }
-    
-    function resetZoom() {
-        if(rawData.length > 0) { 
-            let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts;
-            let buff = (maxT - minT) * 0.02;
-            viewMin = minT - buff; viewMax = maxT + buff; draw(); 
-        }
-    }
-
-    fetch('/data_history').then(r=>r.json()).then(data=>{
-        rawData = data;
-        if(rawData.length > 0) {
-            let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts;
-            viewMax = maxT; viewMin = Math.max(minT, maxT - 14400); 
-            draw();
-        } else { draw(); }
-    }).catch(e => { ctx.fillStyle = '#fff'; ctx.fillText('Error loading data', 50, 50); });
+    function resetZoom() { if(rawData.length > 0) { let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts; let buff = (maxT - minT) * 0.02; viewMin = minT - buff; viewMax = maxT + buff; draw(); } }
+    fetch('/data_history').then(r=>r.json()).then(data=>{ rawData = data; if(rawData.length > 0) { let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts; viewMax = maxT; viewMin = Math.max(minT, maxT - 14400); draw(); } else { draw(); } }).catch(e => { ctx.fillStyle = '#fff'; ctx.fillText('Error loading data', 50, 50); });
   </script>
 </body>
 </html>
@@ -954,10 +972,12 @@ void loop() {
     .row input[type='number'] { width: 70px; text-align: center; }
   </style>
   <script>
+    const dotG = "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#4CAF50; margin-right:5px; vertical-align:middle;'></span>";
+    const dotR = "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#f44336; margin-right:5px; vertical-align:middle;'></span>";
+
     function addNetwork() { 
       let s = encodeURIComponent(document.getElementById('ssid').value); let p = encodeURIComponent(document.getElementById('pass').value); 
-      if(!s || !p) return alert('Fill out both fields!'); 
-      fetch('/add_wifi?s=' + s + '&p=' + p).then(res => res.json()).then(data => { location.reload(); }); 
+      if(!s || !p) return alert('Fill out both fields!'); fetch('/add_wifi?s=' + s + '&p=' + p).then(res => res.json()).then(data => { location.reload(); }); 
     } 
     function deleteNetwork(index) { if(confirm('Are you sure?')) fetch('/delete_wifi?index=' + index).then(res => res.json()).then(data => { location.reload(); }); }
     
@@ -969,21 +989,34 @@ void loop() {
       let p3 = document.getElementById('p3').value; let p4 = document.getElementById('p4').value;
       let bd = document.getElementById('batdis').value; let bc = document.getElementById('batchg').value;
       let ap = document.getElementById('animpwm').value; let as = document.getElementById('animspd').value;
+      let me = document.getElementById('mqtten').checked ? 1 : 0;
+      let ms = encodeURIComponent(document.getElementById('mqttsrv').value); let mpt = document.getElementById('mqttprt').value;
+      let mu = encodeURIComponent(document.getElementById('mqttusr').value); let mw = encodeURIComponent(document.getElementById('mqttpwd').value);
+      
       document.getElementById('sys-status').innerText = 'Saving...';
-      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as)
+      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as + '&me=' + me + '&ms=' + ms + '&mpt=' + mpt + '&mu=' + mu + '&mw=' + mw)
         .then(res => res.json()).then(data => { document.getElementById('sys-status').innerText = 'Saved!'; setTimeout(()=>location.reload(), 500); });
     }
+
+    setInterval(() => {
+      fetch('/status').then(r=>r.json()).then(d => {
+        let st = document.getElementById('mqtt-live-status');
+        if (document.getElementById('mqtten').checked) {
+          if(d.mqtt) st.innerHTML = dotG + "<span style='color:#4CAF50;'>Connected to Broker</span>";
+          else st.innerHTML = dotR + "<span style='color:#f44336;'>Disconnected / Retrying...</span>";
+        } else {
+          st.innerHTML = "<span style='color:#aaa;'>MQTT Disabled</span>";
+        }
+      }).catch(e=>{});
+    }, 3000);
   </script>
 </head>
 <body>
   <h2>System Configuration</h2>
   <div class='card'>
-    <label>Device Name (OTA Name):</label><br>
-    <input type='text' id='sysname' value="%SYS_NAME%"><br><br>
-    <label>OTA Password:</label><br>
-    <input type='text' id='otapass' value="%OTA_PASS%"><br><br>
-    <label>Web Page Title:</label><br>
-    <input type='text' id='pagetitle' value="%PAGE_TITLE%"><br><br>
+    <label>Device Name (OTA/MQTT Name):</label><br><input type='text' id='sysname' value="%SYS_NAME%"><br><br>
+    <label>OTA Password:</label><br><input type='text' id='otapass' value="%OTA_PASS%"><br><br>
+    <label>Web Page Title:</label><br><input type='text' id='pagetitle' value="%PAGE_TITLE%"><br><br>
     <label><input type='checkbox' id='baten' %BAT_CHECKED%> Enable Battery Management</label><br><br>
     
     <hr style="border: 0; height: 1px; background-color: #555; margin: 15px 0;">
@@ -1002,10 +1035,20 @@ void loop() {
     <p style="margin-bottom:5px;">Animation Tuning</p>
     <div class='row'><span>Peak Power (0-255):</span><input type='number' id='animpwm' value="%ANIM_PWM%" min="0" max="255"></div>
     <div class='row'><span>Speed (ms per step):</span><input type='number' id='animspd' value="%ANIM_SPD%" min="1" max="255"></div>
-    
-    <button class='btn' onclick='updateSys()' style='margin-top:10px;'>Save Configuration</button>
-    <p id='sys-status' style='color:#4CAF50; font-size:14px; margin-bottom:0;'></p>
   </div>
+
+  <h2>MQTT Broker</h2>
+  <div class='card'>
+    <div id='mqtt-live-status' style='font-size: 14px; font-weight:bold; margin-bottom: 15px;'>%MQTT_STATUS%</div>
+    <label><input type='checkbox' id='mqtten' %MQTT_CHECKED%> Enable Home Assistant MQTT</label><br><br>
+    <label>Server IP:</label><br><input type='text' id='mqttsrv' value="%MQTT_SRV%"><br><br>
+    <label>Port:</label><br><input type='number' id='mqttprt' value="%MQTT_PRT%"><br><br>
+    <label>Username:</label><br><input type='text' id='mqttusr' value="%MQTT_USR%"><br><br>
+    <label>Password:</label><br><input type='password' id='mqttpwd' value="%MQTT_PWD%"><br>
+  </div>
+  
+  <button class='btn' onclick='updateSys()'>Save Configurations</button>
+  <p id='sys-status' style='color:#4CAF50; font-size:14px; font-weight:bold;'></p>
 
   <h2>Network Setup</h2>
   <div class='card'>
@@ -1021,6 +1064,11 @@ void loop() {
 </body>
 </html>
 )rawliteral";
+              
+              String mqttStatusText = "";
+              if (mqttEnabled) { mqttStatusText = mqttClient.connected() ? "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#4CAF50; margin-right:5px; vertical-align:middle;'></span><span style='color:#4CAF50;'>Connected to Broker</span>" : "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#f44336; margin-right:5px; vertical-align:middle;'></span><span style='color:#f44336;'>Disconnected / Retrying...</span>"; } 
+              else { mqttStatusText = "<span style='color:#aaa;'>MQTT Disabled</span>"; }
+
               settingsTemplate.replace("%PAGE_TITLE%", pageTitle);
               settingsTemplate.replace("%SYS_NAME%", sysName);
               settingsTemplate.replace("%OTA_PASS%", otaPassword);
@@ -1033,6 +1081,12 @@ void loop() {
               settingsTemplate.replace("%P4%", String(pwmHigh));
               settingsTemplate.replace("%ANIM_PWM%", String(animPwm));
               settingsTemplate.replace("%ANIM_SPD%", String(animSpeed));
+              settingsTemplate.replace("%MQTT_STATUS%", mqttStatusText);
+              settingsTemplate.replace("%MQTT_CHECKED%", mqttEnabled ? "checked" : "");
+              settingsTemplate.replace("%MQTT_SRV%", mqttServer);
+              settingsTemplate.replace("%MQTT_PRT%", String(mqttPort));
+              settingsTemplate.replace("%MQTT_USR%", mqttUser);
+              settingsTemplate.replace("%MQTT_PWD%", mqttPass);
               settingsTemplate.replace("%NW_LIST%", networkListHTML);
               client.print(settingsTemplate);
             } 
@@ -1041,8 +1095,10 @@ void loop() {
               String powerBtn = (powerState == 0 && currentPWM == 0) ? "<button class=\"btn btn-blue\" style=\"margin:0;\" onclick=\"sendCommand('/device/on')\">Turn ON</button>" : "<button class=\"btn btn-off\" style=\"margin:0;\" onclick=\"sendCommand('/device/off')\">Turn OFF</button>";
               String smartBtnClass = smartModeActive ? "btn-smart-active" : "btn-smart-inactive";
               String smartBtnText = smartModeActive ? "Smart Mode: ON" : "Smart Mode: OFF";
-              
               String batteryUICSS = batteryEnabled ? "" : "display: none;";
+              String mqttDisp = mqttEnabled ? "" : "display: none;";
+              
+              String mqttStatusText = mqttClient.connected() ? "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#4CAF50; margin-right:5px; vertical-align:middle;'></span><span style='color:#4CAF50;'>MQTT Connected</span>" : "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#f44336; margin-right:5px; vertical-align:middle;'></span><span style='color:#f44336;'>MQTT Disconnected</span>";
 
               client.print("HTTP/1.1 200 OK\r\nContent-type:text/html\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n");
               
@@ -1077,6 +1133,9 @@ void loop() {
     .battery-ui { %BATTERY_CSS% }
   </style>
   <script>
+    const dotG = "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#4CAF50; margin-right:5px; vertical-align:middle;'></span>";
+    const dotR = "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#f44336; margin-right:5px; vertical-align:middle;'></span>";
+
     function handleResponse(data) { 
       document.getElementById('state-display').innerText = data.state; 
       document.getElementById('pwmSlider').value = data.pwm; document.getElementById('sliderValue').innerText = data.pwm; 
@@ -1092,11 +1151,25 @@ void loop() {
     function sendPWM(val) { fetch('/device/pwm?val=' + val).then(res => res.json()).then(data => handleResponse(data)); } 
     function toggleTheme() { document.body.classList.toggle('light-mode'); let tb = document.getElementById('theme-btn'); 
       if (document.body.classList.contains('light-mode')) tb.innerHTML = '&#x263E;&#xFE0E;'; else tb.innerHTML = '&#x2600;&#xFE0E;'; }
+      
+    setInterval(() => {
+      fetch('/status').then(r=>r.json()).then(d => {
+        let st = document.getElementById('mqtt-live-status');
+        if(st) {
+          if(d.mqtt) st.innerHTML = dotG + "<span style='color:#4CAF50;'>MQTT Connected</span>";
+          else st.innerHTML = dotR + "<span style='color:#f44336;'>MQTT Disconnected</span>";
+        }
+      }).catch(e=>{});
+    }, 5000);
   </script>
 </head>
 <body>
   <button id='theme-btn' class='theme-btn-top' onclick='toggleTheme()'>&#x2600;&#xFE0E;</button>
-  <h1>%SYS_NAME%</h1>
+  <h1 style='margin-bottom:5px;'>%SYS_NAME%</h1>
+  <div style='%MQTT_DISP%'>
+    <div id='mqtt-live-status' style='font-size:12px; font-weight:bold; margin-bottom: 20px;'>%MQTT_STATUS%</div>
+  </div>
+  
   <h3>Current State: <strong id='state-display'>%STATE%</strong></h3>
   <div class='flex-row'>
     <span id='power-container'>%POWER%</span>
@@ -1133,6 +1206,8 @@ void loop() {
               htmlTemplate.replace("%SMART_CLASS%", smartBtnClass);
               htmlTemplate.replace("%SMART_TEXT%", smartBtnText);
               htmlTemplate.replace("%BATTERY_CSS%", batteryUICSS);
+              htmlTemplate.replace("%MQTT_DISP%", mqttDisp);
+              htmlTemplate.replace("%MQTT_STATUS%", mqttStatusText);
               client.print(htmlTemplate);
             }
             
