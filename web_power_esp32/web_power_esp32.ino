@@ -66,6 +66,7 @@ unsigned long lastSchedCheckMillis = 0;
 // --- System Configuration Variables ---
 String sysName = "Device";
 String pageTitle = "Wireless Control";
+String otaPassword = "admin";
 bool batteryEnabled = true;
 bool smartModeActive = false;
 
@@ -170,6 +171,7 @@ void loadSettings() {
   preferences.begin("sys_settings", true);
   sysName = preferences.getString("sys_name", "Device");
   pageTitle = preferences.getString("page_title", "Wireless Control");
+  otaPassword = preferences.getString("ota_pass", "admin");
   batteryEnabled = preferences.getBool("bat_en", true);
   smartModeActive = preferences.getBool("smart_mode", false);
   scheduleEnabled = preferences.getBool("sched_en", false);
@@ -188,6 +190,7 @@ void saveSettings() {
   preferences.begin("sys_settings", false);
   preferences.putString("sys_name", sysName);
   preferences.putString("page_title", pageTitle);
+  preferences.putString("ota_pass", otaPassword);
   preferences.putBool("bat_en", batteryEnabled);
   preferences.putBool("smart_mode", smartModeActive);
   preferences.putBool("sched_en", scheduleEnabled);
@@ -242,7 +245,7 @@ void triggerManualOverride() {
 void playWifiConnectSequence() {
   for (int pulse = 0; pulse < 2; pulse++) {
     for (int i = 0; i <= animPwm; i += 15) { analogWrite(pwmPin, i); delay(animSpeed); }
-    analogWrite(pwmPin, animPwm); // Guarantee peak
+    analogWrite(pwmPin, animPwm); 
     for (int i = animPwm; i >= 0; i -= 15) { analogWrite(pwmPin, i); delay(animSpeed); }
     analogWrite(pwmPin, 0); delay(100); 
   }
@@ -290,7 +293,7 @@ void setupOTA() {
   host.toLowerCase();
   host.replace(" ", "-");
   ArduinoOTA.setHostname(host.c_str());
-  ArduinoOTA.setPassword("admin"); 
+  ArduinoOTA.setPassword(otaPassword.c_str()); 
   ArduinoOTA.onStart([]() { Serial.println("Start updating"); });
   ArduinoOTA.onEnd([]() { Serial.println("\nEnd"); });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) { Serial.printf("Progress: %u%%\r", (progress / (total / 100))); });
@@ -550,7 +553,8 @@ void loop() {
             // SYSTEM UPDATES
             if (header.indexOf("GET /update_sys?") >= 0) {
               int nStart = header.indexOf("n=") + 2; int nEnd = header.indexOf("&t=", nStart);
-              int tStart = header.indexOf("&t=") + 3; int tEnd = header.indexOf("&b=", tStart);
+              int tStart = header.indexOf("&t=") + 3; int tEnd = header.indexOf("&op=", tStart);
+              int opStart = header.indexOf("&op=") + 4; int opEnd = header.indexOf("&b=", opStart);
               int bStart = header.indexOf("&b=") + 3; int bEnd = header.indexOf("&p1=", bStart);
               int p1Start = header.indexOf("&p1=") + 4; int p1End = header.indexOf("&p2=", p1Start);
               int p2Start = header.indexOf("&p2=") + 4; int p2End = header.indexOf("&p3=", p2Start);
@@ -563,6 +567,7 @@ void loop() {
               
               sysName = urldecode(header.substring(nStart, nEnd));
               pageTitle = urldecode(header.substring(tStart, tEnd));
+              otaPassword = urldecode(header.substring(opStart, opEnd));
               batteryEnabled = header.substring(bStart, bEnd).toInt() == 1;
               pwmMin = header.substring(p1Start, p1End).toInt();
               pwmLow = header.substring(p2Start, p2End).toInt();
@@ -958,13 +963,14 @@ void loop() {
     
     function updateSys() {
       let n = encodeURIComponent(document.getElementById('sysname').value); let t = encodeURIComponent(document.getElementById('pagetitle').value);
+      let op = encodeURIComponent(document.getElementById('otapass').value);
       let b = document.getElementById('baten').checked ? 1 : 0;
       let p1 = document.getElementById('p1').value; let p2 = document.getElementById('p2').value;
       let p3 = document.getElementById('p3').value; let p4 = document.getElementById('p4').value;
       let bd = document.getElementById('batdis').value; let bc = document.getElementById('batchg').value;
       let ap = document.getElementById('animpwm').value; let as = document.getElementById('animspd').value;
       document.getElementById('sys-status').innerText = 'Saving...';
-      fetch('/update_sys?n=' + n + '&t=' + t + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as)
+      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as)
         .then(res => res.json()).then(data => { document.getElementById('sys-status').innerText = 'Saved!'; setTimeout(()=>location.reload(), 500); });
     }
   </script>
@@ -974,6 +980,8 @@ void loop() {
   <div class='card'>
     <label>Device Name (OTA Name):</label><br>
     <input type='text' id='sysname' value="%SYS_NAME%"><br><br>
+    <label>OTA Password:</label><br>
+    <input type='text' id='otapass' value="%OTA_PASS%"><br><br>
     <label>Web Page Title:</label><br>
     <input type='text' id='pagetitle' value="%PAGE_TITLE%"><br><br>
     <label><input type='checkbox' id='baten' %BAT_CHECKED%> Enable Battery Management</label><br><br>
@@ -1015,6 +1023,7 @@ void loop() {
 )rawliteral";
               settingsTemplate.replace("%PAGE_TITLE%", pageTitle);
               settingsTemplate.replace("%SYS_NAME%", sysName);
+              settingsTemplate.replace("%OTA_PASS%", otaPassword);
               settingsTemplate.replace("%BAT_CHECKED%", batteryEnabled ? "checked" : "");
               settingsTemplate.replace("%BAT_DIS%", String(batDischarged, 1));
               settingsTemplate.replace("%BAT_CHG%", String(batCharged, 1));
