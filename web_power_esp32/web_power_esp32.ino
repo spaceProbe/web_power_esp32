@@ -49,6 +49,7 @@ bool firstLogAdded = false;
 unsigned long lastADCMillis = 0;
 const long adcInterval = 5000; 
 float currentBatteryPercentage = 0.0;
+float currentBatteryVoltage = 0.0; 
 
 // --- Schedule & Smart Mode Variables ---
 struct SchedEvent {
@@ -67,6 +68,10 @@ String sysName = "Device";
 String pageTitle = "Wireless Control";
 bool batteryEnabled = true;
 bool smartModeActive = false;
+
+// Battery Tuning
+float batDischarged = 12.2;
+float batCharged = 13.0; 
 
 // Configurable Power Levels
 int pwmMin = 10;
@@ -168,6 +173,8 @@ void loadSettings() {
   pwmLow = preferences.getInt("pwm_low", 50);
   pwmMed = preferences.getInt("pwm_med", 150);
   pwmHigh = preferences.getInt("pwm_high", 255);
+  batDischarged = preferences.getFloat("bat_dis", 12.2);
+  batCharged = preferences.getFloat("bat_chg", 13.0);
   preferences.end();
 }
 
@@ -182,6 +189,8 @@ void saveSettings() {
   preferences.putInt("pwm_low", pwmLow);
   preferences.putInt("pwm_med", pwmMed);
   preferences.putInt("pwm_high", pwmHigh);
+  preferences.putFloat("bat_dis", batDischarged);
+  preferences.putFloat("bat_chg", batCharged);
   preferences.end();
 }
 
@@ -432,8 +441,16 @@ void loop() {
     if (now - lastADCMillis >= adcInterval) {
       lastADCMillis = now;
       int16_t adc0 = ads.readADC_SingleEnded(0);
-      float voltage = ads.computeVolts(adc0);
-      currentBatteryPercentage = (voltage / maxVoltage) * 100.0;
+      float adcVolts = ads.computeVolts(adc0);
+      
+      currentBatteryVoltage = adcVolts * 5.0; 
+      
+      if (batCharged > batDischarged) {
+        currentBatteryPercentage = ((currentBatteryVoltage - batDischarged) / (batCharged - batDischarged)) * 100.0;
+      } else {
+        currentBatteryPercentage = 0.0;
+      }
+
       if (currentBatteryPercentage > 100.0) currentBatteryPercentage = 100.0;
       if (currentBatteryPercentage < 0) currentBatteryPercentage = 0;
       
@@ -529,7 +546,9 @@ void loop() {
               int p1Start = header.indexOf("&p1=") + 4; int p1End = header.indexOf("&p2=", p1Start);
               int p2Start = header.indexOf("&p2=") + 4; int p2End = header.indexOf("&p3=", p2Start);
               int p3Start = header.indexOf("&p3=") + 4; int p3End = header.indexOf("&p4=", p3Start);
-              int p4Start = header.indexOf("&p4=") + 4; int p4End = header.indexOf(" HTTP", p4Start);
+              int p4Start = header.indexOf("&p4=") + 4; int p4End = header.indexOf("&bd=", p4Start);
+              int bdStart = header.indexOf("&bd=") + 4; int bdEnd = header.indexOf("&bc=", bdStart);
+              int bcStart = header.indexOf("&bc=") + 4; int bcEnd = header.indexOf(" HTTP", bcStart);
               
               sysName = urldecode(header.substring(nStart, nEnd));
               pageTitle = urldecode(header.substring(tStart, tEnd));
@@ -538,9 +557,11 @@ void loop() {
               pwmLow = header.substring(p2Start, p2End).toInt();
               pwmMed = header.substring(p3Start, p3End).toInt();
               pwmHigh = header.substring(p4Start, p4End).toInt();
+              batDischarged = header.substring(bdStart, bdEnd).toFloat();
+              batCharged = header.substring(bcStart, bcEnd).toFloat();
               
               saveSettings();
-              setupOTA(); // Refresh hostname immediately
+              setupOTA(); 
               client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}");
             }
             // WI-FI MANAGER
@@ -708,38 +729,184 @@ void loop() {
   <title>%PAGE_TITLE%</title>
   <style>
     body { font-family: Helvetica; text-align: center; background: #121212; color: #fff; padding-top: 20px;} 
-    .chart-container { width: 95%; max-width: 600px; margin: auto; background: #1e1e1e; padding: 10px; border-radius: 10px; overflow: hidden;} 
-    canvas { width: 100%; height: auto; display: block;} 
+    .chart-container { width: 95%; max-width: 800px; margin: auto; background: #1e1e1e; padding: 10px; border-radius: 10px; overflow: hidden; position: relative;} 
+    canvas { width: 100%; height: auto; display: block; cursor: grab;} 
+    canvas:active { cursor: grabbing; }
     .btn-back { background-color: #555; color: white; padding: 12px 24px; font-size: 16px; border-radius: 20px; text-decoration: none; display: inline-block; margin-top: 20px; border: none; cursor: pointer;}
+    .controls { margin-top: 15px; }
+    .controls button { background: #333; border: none; color: #fff; padding: 8px 15px; border-radius: 5px; cursor: pointer; margin: 0 5px; font-size: 14px; }
   </style>
 </head>
 <body>
   <h2>Battery History</h2>
-  <div class='chart-container'><canvas id='batteryChart' width='600' height='350'></canvas></div><br>
+  <h4 style="margin-top: 0; color: #aaa;">Current: %CUR_PCT%% (%CUR_VOLT%V)</h4>
+  <div class='chart-container'>
+    <canvas id='batteryChart' width='800' height='400'></canvas>
+    <div class='controls'>
+        <button onclick='zoomBtn(1.5)'>Zoom Out</button>
+        <button onclick='resetZoom()'>Reset View</button>
+        <button onclick='zoomBtn(0.5)'>Zoom In</button>
+    </div>
+  </div><br>
   <a href='/' class='btn-back'>&#x1F519;&#xFE0E; Back</a>
   <script>
-    fetch('/data_history').then(r => r.json()).then(data => {
-        const canvas = document.getElementById('batteryChart'); const ctx = canvas.getContext('2d');
-        const w = canvas.width; const h = canvas.height; const padX = 45; const padY = 20; const gW = w - padX*2; const gH = h - padY*2;
-        ctx.fillStyle = '#1e1e1e'; ctx.fillRect(0,0,w,h); ctx.fillStyle = '#fff'; ctx.font = '14px Helvetica';
-        if(!data || data.length === 0){ ctx.fillText('Waiting for first log...', w/2-60, h/2); return; }
-        ctx.textAlign = 'right'; ctx.fillText('100%', padX-5, padY+5); ctx.fillText('50%', padX-5, padY+gH/2+5); ctx.fillText('0%', padX-5, padY+gH);
-        ctx.strokeStyle = '#555'; ctx.beginPath(); ctx.moveTo(padX, padY); ctx.lineTo(padX, padY+gH); ctx.lineTo(padX+gW, padY+gH); ctx.stroke();
-        if(data.length === 1){
-          ctx.beginPath(); ctx.arc(padX+gW/2, padY+gH-(data[0].p/100.0)*gH, 4, 0, 2*Math.PI); ctx.fillStyle = '#21d8f6'; ctx.fill();
-          ctx.textAlign = 'center'; ctx.fillText(new Date(data[0].ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}), padX+gW/2, padY+gH+18); return;
+    let rawData = [];
+    let viewMin = 0, viewMax = 0;
+    const canvas = document.getElementById('batteryChart');
+    const ctx = canvas.getContext('2d');
+
+    function formatTime(ts) {
+        return new Date(ts * 1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+    }
+
+    function draw() {
+        const w = canvas.width, h = canvas.height;
+        const padX = 50, padY = 20, padB = 40;
+        const gW = w - padX - 10, gH = h - padY - padB;
+
+        ctx.fillStyle = '#1e1e1e'; ctx.fillRect(0,0,w,h);
+        ctx.fillStyle = '#fff'; ctx.font = '14px Helvetica';
+
+        if(!rawData.length){ ctx.textAlign='center'; ctx.fillText('Waiting for logs...', w/2, h/2); return; }
+
+        const dataMin = rawData[0].ts; const dataMax = rawData[rawData.length-1].ts;
+        const minRange = 600; 
+        if (viewMax - viewMin < minRange) { let c = (viewMax+viewMin)/2; viewMin = c - minRange/2; viewMax = c + minRange/2; }
+        
+        if (viewMin < dataMin) { let d = dataMin - viewMin; viewMin += d; viewMax += d; }
+        if (viewMax > dataMax) { let d = viewMax - dataMax; viewMin -= d; viewMax -= d; }
+        if (viewMin < dataMin) viewMin = dataMin;
+
+        ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+        for(let p=0; p<=100; p+=25) {
+            let y = padY + gH - (p/100)*gH;
+            ctx.fillText(p+'%', padX-10, y);
+            ctx.strokeStyle = '#333'; ctx.beginPath(); ctx.moveTo(padX, y); ctx.lineTo(padX+gW, y); ctx.stroke();
         }
-        const minT = data[0].ts; const maxT = data[data.length-1].ts; const timeRange = Math.max(maxT-minT, 1);
-        ctx.strokeStyle = '#21d8f6'; ctx.lineWidth = 3; ctx.beginPath();
-        data.forEach((d,i) => { const x = padX + ((d.ts-minT)/timeRange)*gW; const y = padY + gH - (d.p/100.0)*gH; if(i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
-        ctx.stroke(); ctx.textAlign = 'left'; ctx.fillText(new Date(minT*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}), padX, padY+gH+18);
-        ctx.textAlign = 'right'; ctx.fillText(new Date(maxT*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}), padX+gW, padY+gH+18);
-      }).catch(err => { const ctx = document.getElementById('batteryChart').getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillText('Error loading data', 50, 50); });
+
+        ctx.strokeStyle = '#555'; ctx.beginPath(); ctx.moveTo(padX, padY); ctx.lineTo(padX, padY+gH); ctx.lineTo(padX+gW, padY+gH); ctx.stroke();
+
+        let timeRange = viewMax - viewMin;
+        let numTicks = 6;
+        let tickStep = timeRange / numTicks;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        for(let i=0; i<=numTicks; i++) {
+            let t = viewMin + i * tickStep;
+            let x = padX + (t - viewMin)/timeRange * gW;
+            ctx.fillText(formatTime(t), x, padY+gH+10);
+            ctx.beginPath(); ctx.moveTo(x, padY+gH); ctx.lineTo(x, padY+gH+5); ctx.stroke();
+        }
+
+        ctx.save();
+        ctx.beginPath(); ctx.rect(padX, padY, gW, gH); ctx.clip();
+
+        if (rawData.length === 1) {
+            let d = rawData[0];
+            let x = padX + gW/2;
+            let y = padY + gH - (d.p/100.0) * gH;
+            ctx.beginPath(); ctx.arc(x, y, 4, 0, 2*Math.PI); ctx.fillStyle = '#21d8f6'; ctx.fill();
+        } else {
+            ctx.strokeStyle = '#21d8f6'; ctx.lineWidth = 3; ctx.beginPath();
+            let first = true;
+            for(let d of rawData) {
+                if(d.ts < viewMin - timeRange*0.1 || d.ts > viewMax + timeRange*0.1) continue; 
+                let x = padX + ((d.ts - viewMin)/timeRange) * gW;
+                let y = padY + gH - (d.p/100.0) * gH;
+                if(first) { ctx.moveTo(x, y); first = false; } else { ctx.lineTo(x, y); }
+            }
+            ctx.stroke();
+            ctx.lineTo(padX + gW, padY + gH); ctx.lineTo(padX, padY + gH);
+            ctx.fillStyle = 'rgba(33, 216, 246, 0.1)'; ctx.fill();
+        }
+        ctx.restore();
+    }
+
+    let isDragging = false; let lastX = 0; let lastDist = 0;
+
+    function getX(e) {
+        if(e.touches && e.touches.length > 0) {
+            let rect = canvas.getBoundingClientRect();
+            return (e.touches[0].clientX - rect.left) * (canvas.width / rect.width);
+        }
+        return e.offsetX * (canvas.width / canvas.offsetWidth);
+    }
+
+    function getDist(e) {
+        if(e.touches && e.touches.length === 2) {
+            let dx = e.touches[0].clientX - e.touches[1].clientX;
+            let dy = e.touches[0].clientY - e.touches[1].clientY;
+            return Math.sqrt(dx*dx + dy*dy);
+        }
+        return 0;
+    }
+
+    canvas.addEventListener('mousedown', e => { isDragging = true; lastX = getX(e); });
+    canvas.addEventListener('mousemove', e => {
+        if(!isDragging) return;
+        let x = getX(e); let dx = x - lastX;
+        let dt = (dx / (canvas.width - 60)) * (viewMax - viewMin);
+        viewMin -= dt; viewMax -= dt; lastX = x; draw();
+    });
+    canvas.addEventListener('mouseup', () => isDragging = false);
+    canvas.addEventListener('mouseleave', () => isDragging = false);
+
+    canvas.addEventListener('touchstart', e => {
+        if(e.touches.length === 1) { isDragging = true; lastX = getX(e); }
+        if(e.touches.length === 2) { isDragging = false; lastDist = getDist(e); }
+    });
+    canvas.addEventListener('touchmove', e => {
+        e.preventDefault();
+        if(e.touches.length === 1 && isDragging) {
+            let x = getX(e); let dx = x - lastX;
+            let dt = (dx / (canvas.width - 60)) * (viewMax - viewMin);
+            viewMin -= dt; viewMax -= dt; lastX = x; draw();
+        }
+        if(e.touches.length === 2) {
+            let dist = getDist(e); let zoom = lastDist / dist;
+            zoomCenter(1.0, zoom); 
+            lastDist = dist;
+        }
+    }, {passive: false});
+    canvas.addEventListener('touchend', () => isDragging = false);
+
+    canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        let rect = canvas.getBoundingClientRect(); let x = e.clientX - rect.left;
+        let pct = (x - 50) / (rect.width - 60);
+        if(pct < 0) pct = 0; if(pct > 1) pct = 1;
+        zoomCenter(pct, e.deltaY > 0 ? 1.2 : 0.8);
+    }, {passive: false});
+
+    function zoomCenter(pct, factor) {
+        let range = viewMax - viewMin; let tCenter = viewMin + pct * range; let newRange = range * factor;
+        viewMin = tCenter - pct * newRange; viewMax = tCenter + (1 - pct) * newRange; draw();
+    }
+
+    function zoomBtn(factor) { zoomCenter(1.0, factor); }
+    
+    function resetZoom() {
+        if(rawData.length > 0) { 
+            let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts;
+            let buff = (maxT - minT) * 0.02;
+            viewMin = minT - buff; viewMax = maxT + buff; draw(); 
+        }
+    }
+
+    fetch('/data_history').then(r=>r.json()).then(data=>{
+        rawData = data;
+        if(rawData.length > 0) {
+            let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts;
+            viewMax = maxT; viewMin = Math.max(minT, maxT - 14400); 
+            draw();
+        } else { draw(); }
+    }).catch(e => { ctx.fillStyle = '#fff'; ctx.fillText('Error loading data', 50, 50); });
   </script>
 </body>
 </html>
 )rawliteral";
               historyTemplate.replace("%PAGE_TITLE%", pageTitle);
+              historyTemplate.replace("%CUR_PCT%", String((int)currentBatteryPercentage));
+              historyTemplate.replace("%CUR_VOLT%", String(currentBatteryVoltage, 1));
               client.print(historyTemplate);
             } 
             else if (header.indexOf("GET /settings HTTP") >= 0) {
@@ -781,8 +948,9 @@ void loop() {
       let b = document.getElementById('baten').checked ? 1 : 0;
       let p1 = document.getElementById('p1').value; let p2 = document.getElementById('p2').value;
       let p3 = document.getElementById('p3').value; let p4 = document.getElementById('p4').value;
+      let bd = document.getElementById('batdis').value; let bc = document.getElementById('batchg').value;
       document.getElementById('sys-status').innerText = 'Saving...';
-      fetch('/update_sys?n=' + n + '&t=' + t + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4)
+      fetch('/update_sys?n=' + n + '&t=' + t + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc)
         .then(res => res.json()).then(data => { document.getElementById('sys-status').innerText = 'Saved!'; setTimeout(()=>location.reload(), 500); });
     }
   </script>
@@ -795,6 +963,12 @@ void loop() {
     <label>Web Page Title:</label><br>
     <input type='text' id='pagetitle' value="%PAGE_TITLE%"><br><br>
     <label><input type='checkbox' id='baten' %BAT_CHECKED%> Enable Battery Management</label><br><br>
+    
+    <hr style="border: 0; height: 1px; background-color: #555; margin: 15px 0;">
+    <p style="margin-bottom:5px;">Battery Chemistry Curve</p>
+    <div class='row'><span>0% Voltage:</span><input type='number' step='0.1' id='batdis' value="%BAT_DIS%"></div>
+    <div class='row'><span>100% Voltage:</span><input type='number' step='0.1' id='batchg' value="%BAT_CHG%"></div>
+    
     <hr style="border: 0; height: 1px; background-color: #555; margin: 15px 0;">
     <p style="margin-bottom:5px;">Power Tuning (0-255)</p>
     <div class='row'><span>MIN:</span><input type='number' id='p1' value="%P1%" min="0" max="255"></div>
@@ -822,6 +996,8 @@ void loop() {
               settingsTemplate.replace("%PAGE_TITLE%", pageTitle);
               settingsTemplate.replace("%SYS_NAME%", sysName);
               settingsTemplate.replace("%BAT_CHECKED%", batteryEnabled ? "checked" : "");
+              settingsTemplate.replace("%BAT_DIS%", String(batDischarged, 1));
+              settingsTemplate.replace("%BAT_CHG%", String(batCharged, 1));
               settingsTemplate.replace("%P1%", String(pwmMin));
               settingsTemplate.replace("%P2%", String(pwmLow));
               settingsTemplate.replace("%P3%", String(pwmMed));
@@ -857,9 +1033,16 @@ void loop() {
     .btn-group { display: flex; width: 95%; max-width: 400px; margin: 0 auto; gap: 5px; }
     .flex-btn { flex: 1; padding: 12px 5px; font-size: 16px; margin: 0; box-sizing: border-box; min-width: 60px; }
     .nav-btn { background-color: #333; padding: 12px 24px; font-size: 14px; border-radius: 20px; margin-top: 10px; margin-bottom: 30px; color: white; text-decoration: none; display: inline-block;} 
+    
+    .slider-container { background: #1e1e1e; padding: 20px; border-radius: 12px; width: 85%; max-width: 400px; margin: 20px auto; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+    .light-mode .slider-container { background: #fff; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+    .slider-header { display: flex; justify-content: space-between; font-size: 18px; margin-bottom: 15px; font-weight: bold; }
+    .slider { -webkit-appearance: none; width: 100%; height: 8px; border-radius: 4px; background: #333; outline: none; }
+    .light-mode .slider { background: #ddd; }
+    .slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 28px; height: 28px; border-radius: 50%; background: #4CAF50; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.3); transition: transform 0.1s;}
+    .slider::-webkit-slider-thumb:active { transform: scale(1.15); }
+    
     hr { border: 0; height: 1px; background-color: #555; margin: 30px 10%; } 
-    .slider { -webkit-appearance: none; width: 80%; height: 15px; border-radius: 5px; background: #d3d3d3; outline: none; margin-bottom: 10px; } 
-    .slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 30px; height: 30px; border-radius: 50%; background: #4CAF50; cursor: pointer; }
     .battery-ui { %BATTERY_CSS% }
   </style>
   <script>
@@ -888,12 +1071,15 @@ void loop() {
     <span id='power-container'>%POWER%</span>
     <button id='smart-btn' class='btn %SMART_CLASS% battery-ui' onclick="sendCommand('/device/smart')">%SMART_TEXT%</button>
   </div>
-  <hr>
-  <div>
+  
+  <div class='slider-container'>
+    <div class='slider-header'>
+      <span>Power</span>
+      <span style='color: #4CAF50;' id='sliderValue'>%PWM%</span>
+    </div>
     <input type='range' min='0' max='255' value='%PWM%' class='slider' id='pwmSlider' oninput='updateSliderUI(this.value)' onchange='sendPWM(this.value)'>
-    <p>Custom Brightness: <strong id='sliderValue'>%PWM%</strong></p>
   </div>
-  <hr>
+  
   <div class='btn-group'>
     <button class='btn flex-btn' onclick="sendCommand('/device/min')">MIN</button>
     <button class='btn flex-btn' onclick="sendCommand('/device/low')">LOW</button>
