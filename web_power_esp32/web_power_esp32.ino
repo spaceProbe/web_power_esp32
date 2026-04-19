@@ -6,7 +6,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <time.h> 
-#include <PubSubClient.h> // REQUIRED: Install "PubSubClient" by Nick O'Leary
+#include <PubSubClient.h> 
 
 // I2C Reading
 #include <Wire.h>
@@ -76,6 +76,7 @@ String pageTitle = "Wireless Control";
 String otaPassword = "admin";
 bool batteryEnabled = true;
 bool smartModeActive = false;
+bool usePercent = false; // NEW: Toggle for Slider Display
 
 // MQTT Config
 bool mqttEnabled = false;
@@ -189,6 +190,7 @@ void loadSettings() {
   pageTitle = preferences.getString("page_title", "Wireless Control");
   otaPassword = preferences.getString("ota_pass", "admin");
   batteryEnabled = preferences.getBool("bat_en", true);
+  usePercent = preferences.getBool("use_pct", false);
   smartModeActive = preferences.getBool("smart_mode", false);
   scheduleEnabled = preferences.getBool("sched_en", false);
   pwmMin = preferences.getInt("pwm_min", 10);
@@ -214,6 +216,7 @@ void saveSettings() {
   preferences.putString("page_title", pageTitle);
   preferences.putString("ota_pass", otaPassword);
   preferences.putBool("bat_en", batteryEnabled);
+  preferences.putBool("use_pct", usePercent);
   preferences.putBool("smart_mode", smartModeActive);
   preferences.putBool("sched_en", scheduleEnabled);
   preferences.putInt("pwm_min", pwmMin);
@@ -302,7 +305,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String t = String(topic);
   String p = "";
   for (int i = 0; i < length; i++) { p += (char)payload[i]; }
-  
   String base = getBaseTopic();
   
   if (t == base + "/power/set") {
@@ -325,7 +327,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       saveSettings();
     }
   }
-  
   applyPowerState();
   syncState();
 }
@@ -350,7 +351,7 @@ void handleMQTT() {
         mqttClient.subscribe(String(getBaseTopic() + "/power/set").c_str());
         mqttClient.subscribe(String(getBaseTopic() + "/pwm/set").c_str());
         mqttClient.subscribe(String(getBaseTopic() + "/smart/set").c_str());
-        syncState(); // Publish immediate state on fresh connection
+        syncState(); 
       } else {
         Serial.print("failed, rc="); Serial.println(mqttClient.state());
       }
@@ -555,7 +556,6 @@ void loop() {
       lastADCMillis = now;
       int16_t adc0 = ads.readADC_SingleEnded(0);
       float adcVolts = ads.computeVolts(adc0);
-      
       currentBatteryVoltage = adcVolts * 5.0; 
       
       if (batCharged > batDischarged) {
@@ -602,18 +602,13 @@ void loop() {
     syncState();
   }
   
-  if (mqttNeedsSync) {
-    publishMqttState();
-    mqttNeedsSync = false;
-  }
+  if (mqttNeedsSync) { publishMqttState(); mqttNeedsSync = false; }
 
   if (Serial.available() > 0) {
     int input = Serial.parseInt();
     while (Serial.available() > 0) Serial.read(); 
     if (input >= 0 && input <= 255) {
-      triggerManualOverride();
-      pwmOveride = 1; currentPWM = input;
-      analogWrite(pwmPin, currentPWM); syncState();
+      triggerManualOverride(); pwmOveride = 1; currentPWM = input; analogWrite(pwmPin, currentPWM); syncState();
     }
   }
 
@@ -648,8 +643,7 @@ void loop() {
     while (client.connected() && currentTime - previousTime <= timeoutTime) {
       currentTime = millis();
       if (client.available()) {
-        char c = client.read();
-        header += c;
+        char c = client.read(); header += c;
         if (c == '\n') {
           if (currentLine.length() == 0) {
             
@@ -658,7 +652,8 @@ void loop() {
               int nStart = header.indexOf("n=") + 2; int nEnd = header.indexOf("&t=", nStart);
               int tStart = header.indexOf("&t=") + 3; int tEnd = header.indexOf("&op=", tStart);
               int opStart = header.indexOf("&op=") + 4; int opEnd = header.indexOf("&b=", opStart);
-              int bStart = header.indexOf("&b=") + 3; int bEnd = header.indexOf("&p1=", bStart);
+              int bStart = header.indexOf("&b=") + 3; int bEnd = header.indexOf("&up=", bStart);
+              int upStart = header.indexOf("&up=") + 4; int upEnd = header.indexOf("&p1=", upStart);
               int p1Start = header.indexOf("&p1=") + 4; int p1End = header.indexOf("&p2=", p1Start);
               int p2Start = header.indexOf("&p2=") + 4; int p2End = header.indexOf("&p3=", p2Start);
               int p3Start = header.indexOf("&p3=") + 4; int p3End = header.indexOf("&p4=", p3Start);
@@ -677,6 +672,7 @@ void loop() {
               pageTitle = urldecode(header.substring(tStart, tEnd));
               otaPassword = urldecode(header.substring(opStart, opEnd));
               batteryEnabled = header.substring(bStart, bEnd).toInt() == 1;
+              usePercent = header.substring(upStart, upEnd).toInt() == 1;
               pwmMin = header.substring(p1Start, p1End).toInt();
               pwmLow = header.substring(p2Start, p2End).toInt();
               pwmMed = header.substring(p3Start, p3End).toInt();
@@ -695,14 +691,18 @@ void loop() {
               saveSettings(); setupOTA(); 
               if (mqttServer != "") mqttClient.setServer(mqttServer.c_str(), mqttPort);
               if (mqttClient.connected()) mqttClient.disconnect(); 
-              lastMqttReconnectAttempt = 0; // Force immediate reconnect attempt
-              
+              lastMqttReconnectAttempt = 0; 
               client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}");
             }
-            // LIVE STATUS POLLING API
-            else if (header.indexOf("GET /status HTTP") >= 0) {
+            // LIVE STATE POLLING API
+            else if (header.indexOf("GET /state HTTP") >= 0) {
+              String pwrStr = (pwmOveride == 1) ? "MANUAL OVERRIDE" : (powerState == 0 ? "OFF" : (powerState == 1 ? "MIN" : (powerState == 2 ? "LOW" : (powerState == 3 ? "MED" : "HIGH"))));
+              String smartStr = smartModeActive ? "true" : "false";
               String mqttStr = mqttClient.connected() ? "true" : "false";
-              client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"mqtt\":" + mqttStr + "}");
+              String json = "{\"state\":\"" + pwrStr + "\",\"pwm\":" + String(currentPWM) + ",\"smart\":" + smartStr + ",\"mqtt\":" + mqttStr;
+              if(batteryEnabled) { json += ",\"bat_p\":" + String((int)currentBatteryPercentage) + ",\"bat_v\":" + String(currentBatteryVoltage, 2); }
+              json += "}";
+              client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n" + json);
             }
             // WI-FI MANAGER
             else if (header.indexOf("GET /add_wifi") >= 0) {
@@ -751,7 +751,6 @@ void loop() {
             // DEVICE CONTROLS
             else if (header.indexOf("GET /device/") >= 0) {
               triggerManualOverride(); 
-              
               if (header.indexOf("/smart") >= 0 && batteryEnabled) {
                 smartModeActive = !smartModeActive; saveSettings();
                 if (smartModeActive) { 
@@ -777,7 +776,6 @@ void loop() {
                 if (newVal == 0) { powerState = 0; pwmOveride = 0; } else { currentPWM = newVal; pwmOveride = 1; }
                 analogWrite(pwmPin, currentPWM);
               }
-              
               printNow = 1; syncState();
               String stateStr = (pwmOveride == 1) ? "MANUAL OVERRIDE" : (powerState == 0 ? "OFF" : (powerState == 1 ? "MIN" : (powerState == 2 ? "LOW" : (powerState == 3 ? "MED" : "HIGH"))));
               String smartStr = smartModeActive ? "true" : "false";
@@ -877,7 +875,7 @@ void loop() {
 </head>
 <body>
   <h2>Battery History</h2>
-  <h4 style="margin-top: 0; color: #aaa;">Current: %CUR_PCT%% (%CUR_VOLT%V)</h4>
+  <h4 id='live-batt' style="margin-top: 0; color: #aaa;">Current: %CUR_PCT%% (%CUR_VOLT%V)</h4>
   <div class='chart-container'>
     <canvas id='batteryChart' width='800' height='400'></canvas>
     <div class='controls'>
@@ -935,14 +933,21 @@ void loop() {
     function zoomCenter(pct, factor) { let range = viewMax - viewMin; let tCenter = viewMin + pct * range; let newRange = range * factor; viewMin = tCenter - pct * newRange; viewMax = tCenter + (1 - pct) * newRange; draw(); }
     function zoomBtn(factor) { zoomCenter(1.0, factor); }
     function resetZoom() { if(rawData.length > 0) { let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts; let buff = (maxT - minT) * 0.02; viewMin = minT - buff; viewMax = maxT + buff; draw(); } }
-    fetch('/data_history').then(r=>r.json()).then(data=>{ rawData = data; if(rawData.length > 0) { let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts; viewMax = maxT; viewMin = Math.max(minT, maxT - 14400); draw(); } else { draw(); } }).catch(e => { ctx.fillStyle = '#fff'; ctx.fillText('Error loading data', 50, 50); });
+    
+    fetch('/data_history').then(r=>r.json()).then(data=>{ rawData = data; if(rawData.length > 0) { let maxT = rawData[rawData.length-1].ts; let minT = rawData[0].ts; viewMax = maxT; viewMin = Math.max(minT, maxT - 14400); draw(); } else { draw(); } }).catch(e => {});
+    
+    setInterval(() => {
+      fetch('/state').then(r=>r.json()).then(d => {
+        if(d.bat_v !== undefined) document.getElementById('live-batt').innerText = "Current: " + d.bat_p + "% (" + d.bat_v + "V)";
+      }).catch(e=>{});
+    }, 2500);
   </script>
 </body>
 </html>
 )rawliteral";
               historyTemplate.replace("%PAGE_TITLE%", pageTitle);
               historyTemplate.replace("%CUR_PCT%", String((int)currentBatteryPercentage));
-              historyTemplate.replace("%CUR_VOLT%", String(currentBatteryVoltage, 1));
+              historyTemplate.replace("%CUR_VOLT%", String(currentBatteryVoltage, 2));
               client.print(historyTemplate);
             } 
             else if (header.indexOf("GET /settings HTTP") >= 0) {
@@ -985,6 +990,7 @@ void loop() {
       let n = encodeURIComponent(document.getElementById('sysname').value); let t = encodeURIComponent(document.getElementById('pagetitle').value);
       let op = encodeURIComponent(document.getElementById('otapass').value);
       let b = document.getElementById('baten').checked ? 1 : 0;
+      let up = document.getElementById('usepct').checked ? 1 : 0;
       let p1 = document.getElementById('p1').value; let p2 = document.getElementById('p2').value;
       let p3 = document.getElementById('p3').value; let p4 = document.getElementById('p4').value;
       let bd = document.getElementById('batdis').value; let bc = document.getElementById('batchg').value;
@@ -994,12 +1000,12 @@ void loop() {
       let mu = encodeURIComponent(document.getElementById('mqttusr').value); let mw = encodeURIComponent(document.getElementById('mqttpwd').value);
       
       document.getElementById('sys-status').innerText = 'Saving...';
-      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as + '&me=' + me + '&ms=' + ms + '&mpt=' + mpt + '&mu=' + mu + '&mw=' + mw)
+      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&up=' + up + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as + '&me=' + me + '&ms=' + ms + '&mpt=' + mpt + '&mu=' + mu + '&mw=' + mw)
         .then(res => res.json()).then(data => { document.getElementById('sys-status').innerText = 'Saved!'; setTimeout(()=>location.reload(), 500); });
     }
 
     setInterval(() => {
-      fetch('/status').then(r=>r.json()).then(d => {
+      fetch('/state').then(r=>r.json()).then(d => {
         let st = document.getElementById('mqtt-live-status');
         if (document.getElementById('mqtten').checked) {
           if(d.mqtt) st.innerHTML = dotG + "<span style='color:#4CAF50;'>Connected to Broker</span>";
@@ -1008,7 +1014,7 @@ void loop() {
           st.innerHTML = "<span style='color:#aaa;'>MQTT Disabled</span>";
         }
       }).catch(e=>{});
-    }, 3000);
+    }, 2500);
   </script>
 </head>
 <body>
@@ -1018,6 +1024,7 @@ void loop() {
     <label>OTA Password:</label><br><input type='text' id='otapass' value="%OTA_PASS%"><br><br>
     <label>Web Page Title:</label><br><input type='text' id='pagetitle' value="%PAGE_TITLE%"><br><br>
     <label><input type='checkbox' id='baten' %BAT_CHECKED%> Enable Battery Management</label><br><br>
+    <label><input type='checkbox' id='usepct' %PCT_CHECKED%> Display Power as Percentage</label><br><br>
     
     <hr style="border: 0; height: 1px; background-color: #555; margin: 15px 0;">
     <p style="margin-bottom:5px;">Battery Chemistry Curve</p>
@@ -1073,6 +1080,7 @@ void loop() {
               settingsTemplate.replace("%SYS_NAME%", sysName);
               settingsTemplate.replace("%OTA_PASS%", otaPassword);
               settingsTemplate.replace("%BAT_CHECKED%", batteryEnabled ? "checked" : "");
+              settingsTemplate.replace("%PCT_CHECKED%", usePercent ? "checked" : "");
               settingsTemplate.replace("%BAT_DIS%", String(batDischarged, 1));
               settingsTemplate.replace("%BAT_CHG%", String(batCharged, 1));
               settingsTemplate.replace("%P1%", String(pwmMin));
@@ -1097,6 +1105,10 @@ void loop() {
               String smartBtnText = smartModeActive ? "Smart Mode: ON" : "Smart Mode: OFF";
               String batteryUICSS = batteryEnabled ? "" : "display: none;";
               String mqttDisp = mqttEnabled ? "" : "display: none;";
+              
+              String pwmDispVal = usePercent ? String((int)round(currentPWM / 2.55)) + "%" : String(currentPWM);
+              String pwmSliderVal = usePercent ? String((int)round(currentPWM / 2.55)) : String(currentPWM);
+              String sliderMax = usePercent ? "100" : "255";
               
               String mqttStatusText = mqttClient.connected() ? "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#4CAF50; margin-right:5px; vertical-align:middle;'></span><span style='color:#4CAF50;'>MQTT Connected</span>" : "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#f44336; margin-right:5px; vertical-align:middle;'></span><span style='color:#f44336;'>MQTT Disconnected</span>";
 
@@ -1128,7 +1140,6 @@ void loop() {
     .light-mode .slider { background: #ddd; }
     .slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 28px; height: 28px; border-radius: 50%; background: #4CAF50; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.3); transition: transform 0.1s;}
     .slider::-webkit-slider-thumb:active { transform: scale(1.15); }
-    
     hr { border: 0; height: 1px; background-color: #555; margin: 30px 10%; } 
     .battery-ui { %BATTERY_CSS% }
   </style>
@@ -1136,31 +1147,57 @@ void loop() {
     const dotG = "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#4CAF50; margin-right:5px; vertical-align:middle;'></span>";
     const dotR = "<span style='display:inline-block; width:12px; height:12px; border-radius:50%; background-color:#f44336; margin-right:5px; vertical-align:middle;'></span>";
 
+    const usePct = %USE_PCT%;
+    let sliderDragging = false;
+
     function handleResponse(data) { 
       document.getElementById('state-display').innerText = data.state; 
-      document.getElementById('pwmSlider').value = data.pwm; document.getElementById('sliderValue').innerText = data.pwm; 
+      
+      let dispVal = usePct ? Math.round(data.pwm / 2.55) : data.pwm;
+      
+      if(!sliderDragging) {
+        document.getElementById('pwmSlider').value = dispVal; 
+        document.getElementById('sliderValue').innerText = dispVal + (usePct ? "%" : ""); 
+      }
+      
       let pBtn = document.getElementById('power-container'); 
       if(data.state === 'OFF') pBtn.innerHTML = '<button class="btn btn-blue" style="margin:0;" onclick="sendCommand(\'/device/on\')">Turn ON</button>'; 
       else pBtn.innerHTML = '<button class="btn btn-off" style="margin:0;" onclick="sendCommand(\'/device/off\')">Turn OFF</button>'; 
+      
       let sBtn = document.getElementById('smart-btn');
       if(data.smart) { sBtn.className = "btn btn-smart-active battery-ui"; sBtn.innerText = "Smart Mode: ON"; } 
       else { sBtn.className = "btn btn-smart-inactive battery-ui"; sBtn.innerText = "Smart Mode: OFF"; }
     } 
+    
     function sendCommand(cmd) { fetch(cmd).then(res => res.json()).then(data => handleResponse(data)); } 
-    function updateSliderUI(val) { document.getElementById('sliderValue').innerText = val; } 
-    function sendPWM(val) { fetch('/device/pwm?val=' + val).then(res => res.json()).then(data => handleResponse(data)); } 
+    function updateSliderUI(val) { document.getElementById('sliderValue').innerText = val + (usePct ? "%" : ""); } 
+    
+    function sendPWM(val) { 
+      let sendVal = usePct ? Math.round(val * 2.55) : val;
+      fetch('/device/pwm?val=' + sendVal).then(res => res.json()).then(data => handleResponse(data)); 
+    } 
+    
     function toggleTheme() { document.body.classList.toggle('light-mode'); let tb = document.getElementById('theme-btn'); 
       if (document.body.classList.contains('light-mode')) tb.innerHTML = '&#x263E;&#xFE0E;'; else tb.innerHTML = '&#x2600;&#xFE0E;'; }
       
-    setInterval(() => {
-      fetch('/status').then(r=>r.json()).then(d => {
-        let st = document.getElementById('mqtt-live-status');
-        if(st) {
-          if(d.mqtt) st.innerHTML = dotG + "<span style='color:#4CAF50;'>MQTT Connected</span>";
-          else st.innerHTML = dotR + "<span style='color:#f44336;'>MQTT Disconnected</span>";
-        }
-      }).catch(e=>{});
-    }, 5000);
+    document.addEventListener("DOMContentLoaded", function() {
+        let sl = document.getElementById('pwmSlider');
+        sl.addEventListener('mousedown', () => sliderDragging = true);
+        sl.addEventListener('touchstart', () => sliderDragging = true);
+        sl.addEventListener('mouseup', () => sliderDragging = false);
+        sl.addEventListener('touchend', () => sliderDragging = false);
+        
+        setInterval(() => {
+          fetch('/state').then(r=>r.json()).then(d => {
+            handleResponse(d);
+            let st = document.getElementById('mqtt-live-status');
+            if(st) {
+              if(d.mqtt) st.innerHTML = dotG + "<span style='color:#4CAF50;'>MQTT Connected</span>";
+              else st.innerHTML = dotR + "<span style='color:#f44336;'>MQTT Disconnected</span>";
+            }
+          }).catch(e=>{});
+        }, 2500);
+    });
   </script>
 </head>
 <body>
@@ -1179,9 +1216,9 @@ void loop() {
   <div class='slider-container'>
     <div class='slider-header'>
       <span>Power</span>
-      <span style='color: #4CAF50;' id='sliderValue'>%PWM%</span>
+      <span style='color: #4CAF50;' id='sliderValue'>%PWM_DISP%</span>
     </div>
-    <input type='range' min='0' max='255' value='%PWM%' class='slider' id='pwmSlider' oninput='updateSliderUI(this.value)' onchange='sendPWM(this.value)'>
+    <input type='range' min='0' max='%SLIDER_MAX%' value='%PWM_VAL%' class='slider' id='pwmSlider' oninput='updateSliderUI(this.value)' onchange='sendPWM(this.value)'>
   </div>
   
   <div class='btn-group'>
@@ -1202,7 +1239,10 @@ void loop() {
               htmlTemplate.replace("%SYS_NAME%", sysName);
               htmlTemplate.replace("%STATE%", stateStr);
               htmlTemplate.replace("%POWER%", powerBtn);
-              htmlTemplate.replace("%PWM%", String(currentPWM));
+              htmlTemplate.replace("%USE_PCT%", usePercent ? "true" : "false");
+              htmlTemplate.replace("%PWM_DISP%", pwmDispVal);
+              htmlTemplate.replace("%PWM_VAL%", pwmSliderVal);
+              htmlTemplate.replace("%SLIDER_MAX%", sliderMax);
               htmlTemplate.replace("%SMART_CLASS%", smartBtnClass);
               htmlTemplate.replace("%SMART_TEXT%", smartBtnText);
               htmlTemplate.replace("%BATTERY_CSS%", batteryUICSS);
