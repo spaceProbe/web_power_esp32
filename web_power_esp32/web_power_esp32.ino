@@ -1024,10 +1024,16 @@ void loop() {
             }
             // INITIALIZE / DEVICE MODE (first-run mode chooser)
             else if (header.indexOf("GET /init?") >= 0) {
-              int mStart = header.indexOf("mode=") + 5; int mEnd = header.indexOf(" HTTP", mStart);
+              int batPos = header.indexOf("&bat=");
+              int mStart = header.indexOf("mode=") + 5;
+              int mEnd = (batPos >= 0) ? batPos : header.indexOf(" HTTP", mStart);
               int m = header.substring(mStart, mEnd).toInt();
               if (m < 0 || m > 2) m = 0;
               deviceMode = m; initialized = true;
+              if (batPos >= 0) {
+                int bStart = batPos + 5; int bEnd = header.indexOf(" HTTP", bStart);
+                batteryEnabled = header.substring(bStart, bEnd).toInt() == 1;
+              }
               latchEngaged = false; latchPulsing = false;
               lastScheduledAction = -1; lastPulseMinute = -1;
               saveSettings(); applyOutput();
@@ -1392,7 +1398,7 @@ void loop() {
     <label>Device Name (OTA/MQTT Name):</label><br><input type='text' id='sysname' value="%SYS_NAME%"><br><br>
     <label>OTA Password:</label><br><input type='text' id='otapass' value="%OTA_PASS%"><br><br>
     <label>Web Page Title:</label><br><input type='text' id='pagetitle' value="%PAGE_TITLE%"><br><br>
-    <label><input type='checkbox' id='baten' %BAT_CHECKED%> Enable Battery Management</label><br><br>
+    <label><input type='checkbox' id='baten' %BAT_CHECKED%> Enable Solar / Battery Management</label><br><br>
     <label><input type='checkbox' id='usepct' %PCT_CHECKED%> Display Power as Percentage</label><br><br>
     
     <hr style="border: 0; height: 1px; background-color: #555; margin: 15px 0;">
@@ -1515,16 +1521,21 @@ body{font-family:Helvetica;text-align:center;background:#121212;color:#fff;paddi
 .btn-g{background:#4CAF50;}.btn-p{background:#9C27B0;}.btn-b{background:#2196F3;}.btn-s{background:#555;}
 .sub{color:#aaa;font-size:13px;}
 </style>
-<script>function pick(m){fetch('/init?mode='+m).then(r=>r.json()).then(d=>{location.href='/';});}</script>
+<script>function pick(m){var b=document.getElementById('baten').checked?1:0;fetch('/init?mode='+m+'&bat='+b).then(r=>r.json()).then(d=>{location.href='/';});}</script>
 </head><body>
 <h1>%SYS_NAME%</h1>
-<p class='sub'>First-time setup &mdash; what does this device control?</p>
+<p class='sub'>First-time setup</p>
+<div class='card'>
+<label style='font-size:16px;'><input type='checkbox' id='baten' checked> &#x1F50B; Enable Solar / Battery Management</label>
+<p class='sub' style='margin:8px 0 0;'>Voltage monitoring, Smart Mode, history graph, and low-battery failsafe. Leave on for solar / battery-powered setups; the battery curve is tuned later in Config.</p>
+</div>
+<p class='sub'>Now choose what this device controls:</p>
 <div class='card'>
 <button class='btn btn-g' onclick='pick(0)'>&#x1F4A1; Dimmer (PWM)<br><span class='sub'>Lights, pumps, fans, motors</span></button>
 <button class='btn btn-p' onclick='pick(1)'>&#x1F512; Solenoid / Latch<br><span class='sub'>Door strike, latch, lock</span></button>
 <button class='btn btn-b' onclick='pick(2)'>&#x1F50C; On / Off Switch<br><span class='sub'>Simple relay</span></button>
 </div>
-<p class='sub'>You can change this later in Config.</p>
+<p class='sub'>Tapping a mode finishes setup. You can change everything later in Config.</p>
 <a href='/settings'><button class='btn btn-s' style='width:auto; padding:12px 24px;'>&#x2699;&#xFE0E; Wi-Fi / Config</button></a>
 </body></html>
 )rawliteral";

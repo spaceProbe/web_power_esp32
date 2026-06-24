@@ -67,8 +67,8 @@ To compile this project, you will need the **Arduino IDE** with the **ESP32 Boar
 1. Once powered on, if the ESP32 cannot find a saved Wi-Fi network, it will broadcast its own network.
 2. Connect your phone or computer to the Wi-Fi network named **`Wireless Control Setup`** (Password: `password123`).
 3. Open a web browser and navigate to **`http://192.168.4.1`**.
-4. **Choose your Device Mode** on the first-run welcome screen — **Dimmer**, **Solenoid / Latch**, or **On/Off Switch**. (You can change this later from Config.)
-5. Click on **⚙️ Config** to set up Wi-Fi and tune the rest.
+4. On the first-run welcome screen, choose whether to **enable Solar / Battery Management**, then **pick your Device Mode** — **Dimmer**, **Solenoid / Latch**, or **On/Off Switch**. (Both are changeable later from Config.)
+5. Click on **⚙️ Config** to set up Wi-Fi and tune the rest (including the battery chemistry curve).
 
 ### 3. System Tuning (The Settings Page)
 On the Configuration page, you can tailor the platform entirely to your specific hardware:
