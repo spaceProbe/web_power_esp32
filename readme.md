@@ -10,6 +10,7 @@ A robust, generalized IoT platform for controlling PWM-driven devices (lights, p
 * **Home Assistant Auto-Discovery (MQTT):** Seamlessly integrates into your smart home. Just enter your broker credentials, and the ESP32 will automatically build its own Light, Switch, and Sensor entities inside Home Assistant.
 * **Battery Smart Mode:** Automatically scales device power based on the real-time battery voltage to protect battery chemistry and maximize runtime. Includes configurable 0% and 100% voltage thresholds for custom battery types (AGM, LiFePO4, etc.).
 * **Daily Routine Scheduler:** Set daily time-based actions. Features NTP atomic clock syncing, automatic Daylight Saving Time (DST) adjustments, and "catch-up" state machine logic.
+* **Configurable Timezone:** Pick your zone from a dropdown, or let the device **auto-detect it from the network** (geo-IP) — re-checked periodically so it follows DST. Replaces the old hard-coded timezone.
 * **Dynamic Power & UI Tuning:** Easily configure the exact PWM values (0-255) for MIN, LOW, MED, and HIGH states, customize the animation/breathing mode speed, and toggle between viewing raw PWM values or 0-100% on the web slider.
 * **Over-The-Air (OTA) Updates:** Flash new firmware wirelessly. The OTA hostname automatically matches your custom device name and uses your custom password.
 * **Captive Portal Setup:** If no known Wi-Fi network is found, the device broadcasts a "Wireless Control Setup" Access Point for easy onboarding.
@@ -84,6 +85,10 @@ On the Configuration page, you can tailor the platform entirely to your specific
 * **Hold auto-relock (ms):** Optional safety timeout for Hold mode (`0` = stay unlocked until told to lock).
 * **Energize level (0-255):** Drive strength applied while energized (255 = full on).
 * **Active-low output:** Invert the pin for relay/driver boards that energize on a LOW signal.
+
+**Time & Date**
+* **Auto-detect timezone from network:** When enabled, the device looks up its timezone via geo-IP (ip-api.com) on connect and re-checks every few hours, so DST is handled automatically. *(Requires outbound internet access.)*
+* **Manual timezone:** Pick your region from the dropdown instead. Known zones carry full DST rules; an auto-detected zone outside the built-in list falls back to a fixed UTC offset (correct now, but won't auto-shift for DST until the next re-check).
 
 **UI & Hardware Config**
 * **Enable Battery Management:** Toggle the ADC polling and battery failsafes on or off.

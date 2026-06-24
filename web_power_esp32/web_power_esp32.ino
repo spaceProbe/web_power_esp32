@@ -121,6 +121,33 @@ int lastPulseMinute = -1;    // schedule pulse de-dupe (minute-of-day)
 // --- Switch Mode ---
 bool switchOn = false;
 
+// --- Timezone ---
+String tzPosix = "CST6CDT,M3.2.0,M11.1.0";  // POSIX TZ string (manual default: US Central)
+bool tzAuto = false;                          // auto-detect from network (geo-IP)
+unsigned long lastTzSyncMillis = 0;
+bool tzSyncPending = false;
+
+// IANA -> POSIX map; powers both the manual dropdown and network auto-detect.
+struct TzZone { const char* iana; const char* posix; const char* label; };
+const TzZone TZ_ZONES[] = {
+  {"America/New_York",    "EST5EDT,M3.2.0,M11.1.0",     "US Eastern"},
+  {"America/Chicago",     "CST6CDT,M3.2.0,M11.1.0",     "US Central"},
+  {"America/Denver",      "MST7MDT,M3.2.0,M11.1.0",     "US Mountain"},
+  {"America/Phoenix",     "MST7",                       "US Arizona (no DST)"},
+  {"America/Los_Angeles", "PST8PDT,M3.2.0,M11.1.0",     "US Pacific"},
+  {"America/Anchorage",   "AKST9AKDT,M3.2.0,M11.1.0",   "US Alaska"},
+  {"Pacific/Honolulu",    "HST10",                      "US Hawaii"},
+  {"UTC",                 "UTC0",                        "UTC"},
+  {"Europe/London",       "GMT0BST,M3.5.0/1,M10.5.0",   "UK / Ireland"},
+  {"Europe/Paris",        "CET-1CEST,M3.5.0,M10.5.0/3", "Central Europe"},
+  {"Europe/Athens",       "EET-2EEST,M3.5.0/3,M10.5.0/4","Eastern Europe"},
+  {"Asia/Kolkata",        "IST-5:30",                   "India"},
+  {"Asia/Shanghai",       "CST-8",                      "China"},
+  {"Asia/Tokyo",          "JST-9",                      "Japan"},
+  {"Australia/Sydney",    "AEST-10AEDT,M10.1.0,M4.1.0/3","Australia Eastern"},
+};
+const int TZ_COUNT = sizeof(TZ_ZONES) / sizeof(TZ_ZONES[0]);
+
 // --- Web Server Setup ---
 WiFiServer server(80);
 String header;
@@ -234,6 +261,8 @@ void loadSettings() {
   solLevel = preferences.getInt("sol_lvl", 255);
   solActiveLow = preferences.getBool("sol_inv", false);
   switchOn = preferences.getBool("sw_on", false);
+  tzPosix = preferences.getString("tz", "CST6CDT,M3.2.0,M11.1.0");
+  tzAuto = preferences.getBool("tz_auto", false);
 
   mqttEnabled = preferences.getBool("mqtt_en", false);
   mqttServer = preferences.getString("mqtt_srv", "");
@@ -269,6 +298,8 @@ void saveSettings() {
   preferences.putInt("sol_lvl", solLevel);
   preferences.putBool("sol_inv", solActiveLow);
   preferences.putBool("sw_on", switchOn);
+  preferences.putString("tz", tzPosix);
+  preferences.putBool("tz_auto", tzAuto);
 
   preferences.putBool("mqtt_en", mqttEnabled);
   preferences.putString("mqtt_srv", mqttServer);
@@ -542,6 +573,73 @@ void setupOTA() {
   ArduinoOTA.begin();
 }
 
+// --- Timezone Helpers ---
+void applyTimezone() {
+  setenv("TZ", tzPosix.c_str(), 1);
+  tzset();
+}
+
+String posixForIana(const String& iana) {
+  for (int i = 0; i < TZ_COUNT; i++) {
+    if (iana == TZ_ZONES[i].iana) return String(TZ_ZONES[i].posix);
+  }
+  return "";
+}
+
+// Build a fixed-offset POSIX string (no DST) from a UTC offset in seconds.
+// Fallback for when the detected zone isn't in TZ_ZONES. POSIX inverts the offset sign.
+String posixFromOffset(long sec) {
+  long m = sec / 60;
+  long am = m < 0 ? -m : m;
+  int hh = (int)(am / 60), mm = (int)(am % 60);
+  char nameSign = (m >= 0) ? '+' : '-';     // <> name keeps the UTC sign
+  char offSign  = (m >= 0) ? '-' : '+';     // POSIX offset field is sign-inverted
+  char nameBuf[12]; snprintf(nameBuf, sizeof(nameBuf), "<%c%02d%02d>", nameSign, hh, mm);
+  char offBuf[12];
+  if (mm == 0) snprintf(offBuf, sizeof(offBuf), "%c%d", offSign, hh);
+  else snprintf(offBuf, sizeof(offBuf), "%c%d:%02d", offSign, hh, mm);
+  return String(nameBuf) + String(offBuf);
+}
+
+// Query ip-api.com (plain HTTP) for this device's timezone and apply it. Blocking (~3s max).
+bool fetchTimezoneFromNetwork() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient c;
+  if (!c.connect("ip-api.com", 80)) return false;
+  c.print("GET /json/?fields=status,timezone,offset HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+
+  unsigned long t0 = millis();
+  String resp = "";
+  while ((c.connected() || c.available()) && millis() - t0 < 3000) {
+    while (c.available()) { resp += (char)c.read(); t0 = millis(); }
+  }
+  c.stop();
+
+  if (resp.indexOf("\"status\":\"success\"") < 0) return false;
+
+  String iana = "";
+  int tzi = resp.indexOf("\"timezone\":\"");
+  if (tzi >= 0) { int s = tzi + 12; int e = resp.indexOf("\"", s); if (e > s) iana = resp.substring(s, e); }
+
+  long offset = 0; bool haveOffset = false;
+  int oi = resp.indexOf("\"offset\":");
+  if (oi >= 0) {
+    int s = oi + 9; int e = s;
+    while (e < (int)resp.length() && resp[e] != ',' && resp[e] != '}') e++;
+    offset = resp.substring(s, e).toInt(); haveOffset = true;
+  }
+
+  String posix = posixForIana(iana);
+  if (posix == "" && haveOffset) posix = posixFromOffset(offset);
+  if (posix == "") return false;
+
+  tzPosix = posix;
+  applyTimezone();
+  saveSettings();
+  Serial.print("TZ auto-detected ("); Serial.print(iana); Serial.print("): "); Serial.println(tzPosix);
+  return true;
+}
+
 // --- Battery Logging Helpers ---
 bool stringParse(String data, std::vector<BatteryLogEntry>& logs) {
   if (data == "") return false;
@@ -589,12 +687,14 @@ void setup() {
   analogWrite(pwmPin, currentPWM); 
   
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1);
-  tzset();
-  
+
   loadNetworks();
   loadSettings();
   loadSchedule();
+
+  // Apply the saved/configured timezone (replaces the old hardcoded TZ).
+  applyTimezone();
+  if (tzAuto) tzSyncPending = true;
 
   // Existing installs (already have Wi-Fi saved) skip the first-run mode chooser.
   if (!initialized && savedNetworks.size() > 0) { initialized = true; saveSettings(); }
@@ -797,6 +897,13 @@ void loop() {
   
   if (mqttNeedsSync) { publishMqttState(); mqttNeedsSync = false; }
 
+  // Timezone auto-detect: once on connect, then refresh every 6h to catch DST changes.
+  if (tzAuto && WiFi.status() == WL_CONNECTED && (tzSyncPending || now - lastTzSyncMillis >= 21600000UL)) {
+    tzSyncPending = false;
+    lastTzSyncMillis = now;
+    fetchTimezoneFromNetwork();
+  }
+
   if (Serial.available() > 0) {
     int input = Serial.parseInt();
     while (Serial.available() > 0) Serial.read(); 
@@ -824,6 +931,7 @@ void loop() {
     }
   } else if (!wifiWasConnected) {
     wifiWasConnected = true; attemptsInCurrentCycle = 0;
+    if (tzAuto) tzSyncPending = true;  // refresh timezone once we're online
     // The breathing animation drives the output pin — only safe for a dimmable load,
     // not a latch/relay (it would actuate the solenoid on every Wi-Fi (re)connect).
     if (deviceMode == MODE_DIMMER) playWifiConnectSequence();
@@ -868,7 +976,9 @@ void loop() {
               int spStart = header.indexOf("&sp=") + 4; int spEnd = header.indexOf("&sh=", spStart);
               int shStart = header.indexOf("&sh=") + 4; int shEnd = header.indexOf("&sl=", shStart);
               int slStart = header.indexOf("&sl=") + 4; int slEnd = header.indexOf("&si=", slStart);
-              int siStart = header.indexOf("&si=") + 4; int siEnd = header.indexOf(" HTTP", siStart);
+              int siStart = header.indexOf("&si=") + 4; int siEnd = header.indexOf("&tza=", siStart);
+              int tzaStart = header.indexOf("&tza=") + 5; int tzaEnd = header.indexOf("&tz=", tzaStart);
+              int tzStart = header.indexOf("&tz=") + 4; int tzEnd = header.indexOf(" HTTP", tzStart);
 
               sysName = urldecode(header.substring(nStart, nEnd));
               pageTitle = urldecode(header.substring(tStart, tEnd));
@@ -898,12 +1008,15 @@ void loop() {
               solLevel = header.substring(slStart, slEnd).toInt();
               if (solLevel < 0) solLevel = 0; if (solLevel > 255) solLevel = 255;
               solActiveLow = header.substring(siStart, siEnd).toInt() == 1;
+              tzAuto = header.substring(tzaStart, tzaEnd).toInt() == 1;
+              tzPosix = urldecode(header.substring(tzStart, tzEnd));
 
               // Mode/solenoid params changed: reset latch state and schedule tracking, drive safe output.
               latchEngaged = false; latchPulsing = false;
               lastScheduledAction = -1; lastPulseMinute = -1;
 
-              saveSettings(); setupOTA(); applyOutput();
+              saveSettings(); setupOTA(); applyOutput(); applyTimezone();
+              if (tzAuto) tzSyncPending = true;
               if (mqttServer != "") mqttClient.setServer(mqttServer.c_str(), mqttPort);
               if (mqttClient.connected()) mqttClient.disconnect();
               lastMqttReconnectAttempt = 0;
@@ -1191,7 +1304,16 @@ void loop() {
                 networkListHTML += "<button class='btn btn-off' style='padding:6px 12px; font-size:14px; margin:0;' onclick='deleteNetwork(" + String(i) + ")'>X</button></li>";
               }
               if (savedNetworks.empty()) networkListHTML = "<p style='color:#aaa;'>No networks saved yet.</p>";
-              
+
+              String tzOpts = "";
+              bool tzMatched = false;
+              for (int i = 0; i < TZ_COUNT; i++) {
+                bool sel = (tzPosix == TZ_ZONES[i].posix);
+                if (sel) tzMatched = true;
+                tzOpts += "<option value='" + String(TZ_ZONES[i].posix) + "'" + (sel ? " selected" : "") + ">" + String(TZ_ZONES[i].label) + "</option>";
+              }
+              if (!tzMatched) tzOpts += "<option value='" + tzPosix + "' selected>Custom (" + tzPosix + ")</option>";
+
               client.print("HTTP/1.1 200 OK\r\nContent-type:text/html\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n");
               String settingsTemplate = R"rawliteral(
 <!DOCTYPE html><html>
@@ -1235,9 +1357,11 @@ void loop() {
       let sa = document.getElementById('solact').value; let sp = document.getElementById('solpulse').value;
       let sh = document.getElementById('solhold').value; let sl = document.getElementById('sollvl').value;
       let si = document.getElementById('solinv').checked ? 1 : 0;
+      let tza = document.getElementById('tzauto').checked ? 1 : 0;
+      let tz = encodeURIComponent(document.getElementById('tzsel').value);
 
       document.getElementById('sys-status').innerText = 'Saving...';
-      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&up=' + up + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as + '&me=' + me + '&ms=' + ms + '&mpt=' + mpt + '&mu=' + mu + '&mw=' + mw + '&dm=' + dm + '&sa=' + sa + '&sp=' + sp + '&sh=' + sh + '&sl=' + sl + '&si=' + si)
+      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&up=' + up + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as + '&me=' + me + '&ms=' + ms + '&mpt=' + mpt + '&mu=' + mu + '&mw=' + mw + '&dm=' + dm + '&sa=' + sa + '&sp=' + sp + '&sh=' + sh + '&sl=' + sl + '&si=' + si + '&tza=' + tza + '&tz=' + tz)
         .then(res => res.json()).then(data => { document.getElementById('sys-status').innerText = 'Saved!'; setTimeout(()=>location.reload(), 500); });
     }
 
@@ -1304,6 +1428,15 @@ void loop() {
     <label style="display:block; margin-top:10px;"><input type='checkbox' id='solinv' %SOL_INV%> Active-low output (inverting driver)</label>
   </div>
 
+  <h2>Time &amp; Date</h2>
+  <div class='card'>
+    <label><input type='checkbox' id='tzauto' %TZ_AUTO_CHECKED%> Auto-detect timezone from network</label>
+    <p style="margin:10px 0 4px; color:#aaa; font-size:13px;">Or set it manually:</p>
+    <select id='tzsel' style='padding:10px; border-radius:5px; width:85%; max-width:300px;'>
+      %TZ_OPTS%
+    </select>
+  </div>
+
   <h2>MQTT Broker</h2>
   <div class='card'>
     <div id='mqtt-live-status' style='font-size: 14px; font-weight:bold; margin-bottom: 15px;'>%MQTT_STATUS%</div>
@@ -1365,6 +1498,8 @@ void loop() {
               settingsTemplate.replace("%SOL_HOLD%", String(solHoldTimeout));
               settingsTemplate.replace("%SOL_LVL%", String(solLevel));
               settingsTemplate.replace("%SOL_INV%", solActiveLow ? "checked" : "");
+              settingsTemplate.replace("%TZ_AUTO_CHECKED%", tzAuto ? "checked" : "");
+              settingsTemplate.replace("%TZ_OPTS%", tzOpts);
               client.print(settingsTemplate);
             } 
             // ROOT: first-run mode chooser (shown until a mode is picked)
