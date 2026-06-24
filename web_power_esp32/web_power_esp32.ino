@@ -99,6 +99,28 @@ int pwmHigh = 255;
 int animPwm = 255;
 int animSpeed = 10;
 
+// --- Device Mode ---
+#define MODE_DIMMER 0
+#define MODE_SOLENOID 1
+#define MODE_SWITCH 2
+int deviceMode = MODE_DIMMER;
+bool initialized = false;
+
+// --- Solenoid / Latch ---
+int solActuation = 0;        // 0 = momentary pulse, 1 = sustained hold
+int solPulseMs = 500;        // pulse duration (ms)
+int solHoldTimeout = 0;      // hold auto-relock (ms); 0 = stay until locked
+int solLevel = 255;          // energize duty (0-255)
+bool solActiveLow = false;   // invert output for active-low drivers
+bool latchEngaged = false;   // hold mode: currently unlocked (NOT persisted -> fail-secure on boot)
+bool latchPulsing = false;   // pulse in progress
+unsigned long latchPulseStart = 0;
+unsigned long latchEngageStart = 0;
+int lastPulseMinute = -1;    // schedule pulse de-dupe (minute-of-day)
+
+// --- Switch Mode ---
+bool switchOn = false;
+
 // --- Web Server Setup ---
 WiFiServer server(80);
 String header;
@@ -142,6 +164,8 @@ String getActionName(int a) {
   switch(a) {
     case 0: return "Turn OFF"; case 1: return "Power: MIN"; case 2: return "Power: LOW";
     case 3: return "Power: MED"; case 4: return "Power: HIGH"; case 5: return "Battery Smart Mode";
+    case 10: return "Switch ON"; case 11: return "Switch OFF";
+    case 20: return "Unlock / Trigger"; case 21: return "Lock";
     default: return "Unknown";
   }
 }
@@ -201,7 +225,16 @@ void loadSettings() {
   batCharged = preferences.getFloat("bat_chg", 13.0);
   animPwm = preferences.getInt("anim_pwm", 255);
   animSpeed = preferences.getInt("anim_speed", 10);
-  
+
+  deviceMode = preferences.getInt("dev_mode", 0);
+  initialized = preferences.getBool("init", false);
+  solActuation = preferences.getInt("sol_act", 0);
+  solPulseMs = preferences.getInt("sol_pulse", 500);
+  solHoldTimeout = preferences.getInt("sol_hold", 0);
+  solLevel = preferences.getInt("sol_lvl", 255);
+  solActiveLow = preferences.getBool("sol_inv", false);
+  switchOn = preferences.getBool("sw_on", false);
+
   mqttEnabled = preferences.getBool("mqtt_en", false);
   mqttServer = preferences.getString("mqtt_srv", "");
   mqttPort = preferences.getInt("mqtt_prt", 1883);
@@ -227,7 +260,16 @@ void saveSettings() {
   preferences.putFloat("bat_chg", batCharged);
   preferences.putInt("anim_pwm", animPwm);
   preferences.putInt("anim_speed", animSpeed);
-  
+
+  preferences.putInt("dev_mode", deviceMode);
+  preferences.putBool("init", initialized);
+  preferences.putInt("sol_act", solActuation);
+  preferences.putInt("sol_pulse", solPulseMs);
+  preferences.putInt("sol_hold", solHoldTimeout);
+  preferences.putInt("sol_lvl", solLevel);
+  preferences.putBool("sol_inv", solActiveLow);
+  preferences.putBool("sw_on", switchOn);
+
   preferences.putBool("mqtt_en", mqttEnabled);
   preferences.putString("mqtt_srv", mqttServer);
   preferences.putInt("mqtt_prt", mqttPort);
@@ -261,13 +303,19 @@ void syncState() {
 void publishMqttState() {
   if (!mqttClient.connected()) return;
   String base = getBaseTopic();
-  
-  String pwrStr = (powerState == 0 && currentPWM == 0) ? "OFF" : "ON";
-  mqttClient.publish(String(base + "/power/state").c_str(), pwrStr.c_str(), false);
-  mqttClient.publish(String(base + "/pwm/state").c_str(), String(currentPWM).c_str(), false);
-  
-  String smartStr = smartModeActive ? "ON" : "OFF";
-  mqttClient.publish(String(base + "/smart/state").c_str(), smartStr.c_str(), false);
+
+  if (deviceMode == MODE_DIMMER) {
+    String pwrStr = (powerState == 0 && currentPWM == 0) ? "OFF" : "ON";
+    mqttClient.publish(String(base + "/power/state").c_str(), pwrStr.c_str(), false);
+    mqttClient.publish(String(base + "/pwm/state").c_str(), String(currentPWM).c_str(), false);
+    String smartStr = smartModeActive ? "ON" : "OFF";
+    mqttClient.publish(String(base + "/smart/state").c_str(), smartStr.c_str(), false);
+  } else if (deviceMode == MODE_SWITCH) {
+    mqttClient.publish(String(base + "/power/state").c_str(), switchOn ? "ON" : "OFF", false);
+  } else { // MODE_SOLENOID
+    bool energ = (solActuation == 0) ? latchPulsing : latchEngaged;
+    mqttClient.publish(String(base + "/lock/state").c_str(), energ ? "UNLOCKED" : "LOCKED", false);
+  }
 
   if (batteryEnabled) {
     mqttClient.publish(String(base + "/battery").c_str(), String((int)currentBatteryPercentage).c_str(), false);
@@ -278,26 +326,37 @@ void publishMqttState() {
 void publishAutoDiscovery() {
   String base = getBaseTopic();
   String mac = getMacSlug();
-  
-  // 1. Light Entity
-  String lightTopic = "homeassistant/light/" + mac + "/config";
-  String lightPayload = "{\"name\":\"Power\",\"uniq_id\":\"" + mac + "_light\",\"stat_t\":\"" + base + "/power/state\",\"cmd_t\":\"" + base + "/power/set\",\"bri_stat_t\":\"" + base + "/pwm/state\",\"bri_cmd_t\":\"" + base + "/pwm/set\",\"bri_scl\":255,\"dev\":{\"ids\":\"" + mac + "\",\"name\":\"" + sysName + "\",\"mf\":\"Custom\"}}";
-  mqttClient.publish(lightTopic.c_str(), lightPayload.c_str(), true);
+  String dev = "\"dev\":{\"ids\":\"" + mac + "\",\"name\":\"" + sysName + "\",\"mf\":\"Custom\"}";
 
-  // 2. Smart Mode Switch
-  String smartTopic = "homeassistant/switch/" + mac + "_smart/config";
-  String smartPayload = "{\"name\":\"Smart Mode\",\"uniq_id\":\"" + mac + "_smart\",\"stat_t\":\"" + base + "/smart/state\",\"cmd_t\":\"" + base + "/smart/set\",\"ic\":\"mdi:brain\",\"dev\":{\"ids\":\"" + mac + "\"}}";
-  mqttClient.publish(smartTopic.c_str(), smartPayload.c_str(), true);
+  // Clear all primary-entity configs first so stale modes vanish from HA when the mode changes.
+  mqttClient.publish(String("homeassistant/light/" + mac + "/config").c_str(), "", true);
+  mqttClient.publish(String("homeassistant/switch/" + mac + "/config").c_str(), "", true);
+  mqttClient.publish(String("homeassistant/lock/" + mac + "/config").c_str(), "", true);
+  mqttClient.publish(String("homeassistant/switch/" + mac + "_smart/config").c_str(), "", true);
 
-  // 3. Battery Sensors
+  if (deviceMode == MODE_DIMMER) {
+    String lightPayload = "{\"name\":\"Power\",\"uniq_id\":\"" + mac + "_light\",\"stat_t\":\"" + base + "/power/state\",\"cmd_t\":\"" + base + "/power/set\",\"bri_stat_t\":\"" + base + "/pwm/state\",\"bri_cmd_t\":\"" + base + "/pwm/set\",\"bri_scl\":255," + dev + "}";
+    mqttClient.publish(String("homeassistant/light/" + mac + "/config").c_str(), lightPayload.c_str(), true);
+
+    if (batteryEnabled) {
+      String smartPayload = "{\"name\":\"Smart Mode\",\"uniq_id\":\"" + mac + "_smart\",\"stat_t\":\"" + base + "/smart/state\",\"cmd_t\":\"" + base + "/smart/set\",\"ic\":\"mdi:brain\"," + dev + "}";
+      mqttClient.publish(String("homeassistant/switch/" + mac + "_smart/config").c_str(), smartPayload.c_str(), true);
+    }
+  } else if (deviceMode == MODE_SWITCH) {
+    String swPayload = "{\"name\":\"Power\",\"uniq_id\":\"" + mac + "_sw\",\"stat_t\":\"" + base + "/power/state\",\"cmd_t\":\"" + base + "/power/set\"," + dev + "}";
+    mqttClient.publish(String("homeassistant/switch/" + mac + "/config").c_str(), swPayload.c_str(), true);
+  } else { // MODE_SOLENOID
+    String lockPayload = "{\"name\":\"Latch\",\"uniq_id\":\"" + mac + "_lock\",\"stat_t\":\"" + base + "/lock/state\",\"cmd_t\":\"" + base + "/lock/set\",\"stat_locked\":\"LOCKED\",\"stat_unlocked\":\"UNLOCKED\"," + dev + "}";
+    mqttClient.publish(String("homeassistant/lock/" + mac + "/config").c_str(), lockPayload.c_str(), true);
+  }
+
+  // Battery sensors (common to all modes)
   if (batteryEnabled) {
-    String batTopic = "homeassistant/sensor/" + mac + "_bat/config";
-    String batPayload = "{\"name\":\"Battery\",\"uniq_id\":\"" + mac + "_bat\",\"stat_t\":\"" + base + "/battery\",\"unit_of_meas\":\"%\",\"dev_cla\":\"battery\",\"stat_cla\":\"measurement\",\"dev\":{\"ids\":\"" + mac + "\"}}";
-    mqttClient.publish(batTopic.c_str(), batPayload.c_str(), true);
+    String batPayload = "{\"name\":\"Battery\",\"uniq_id\":\"" + mac + "_bat\",\"stat_t\":\"" + base + "/battery\",\"unit_of_meas\":\"%\",\"dev_cla\":\"battery\",\"stat_cla\":\"measurement\"," + dev + "}";
+    mqttClient.publish(String("homeassistant/sensor/" + mac + "_bat/config").c_str(), batPayload.c_str(), true);
 
-    String volTopic = "homeassistant/sensor/" + mac + "_vol/config";
-    String volPayload = "{\"name\":\"Voltage\",\"uniq_id\":\"" + mac + "_vol\",\"stat_t\":\"" + base + "/voltage\",\"unit_of_meas\":\"V\",\"dev_cla\":\"voltage\",\"stat_cla\":\"measurement\",\"dev\":{\"ids\":\"" + mac + "\"}}";
-    mqttClient.publish(volTopic.c_str(), volPayload.c_str(), true);
+    String volPayload = "{\"name\":\"Voltage\",\"uniq_id\":\"" + mac + "_vol\",\"stat_t\":\"" + base + "/voltage\",\"unit_of_meas\":\"V\",\"dev_cla\":\"voltage\",\"stat_cla\":\"measurement\"," + dev + "}";
+    mqttClient.publish(String("homeassistant/sensor/" + mac + "_vol/config").c_str(), volPayload.c_str(), true);
   }
 }
 
@@ -306,28 +365,46 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String p = "";
   for (int i = 0; i < length; i++) { p += (char)payload[i]; }
   String base = getBaseTopic();
-  
-  if (t == base + "/power/set") {
-    scheduleOverride = true;
-    if (p == "ON") { powerState = lastPowerState; pwmOveride = 0; } 
-    else { powerState = 0; pwmOveride = 0; }
-    if (smartModeActive) { smartModeActive = false; saveSettings(); }
-  } 
-  else if (t == base + "/pwm/set") {
-    scheduleOverride = true;
-    int val = p.toInt();
-    if (val < 0) val = 0; if (val > 255) val = 255;
-    if (val == 0) { powerState = 0; pwmOveride = 0; } else { currentPWM = val; pwmOveride = 1; }
-    if (smartModeActive) { smartModeActive = false; saveSettings(); }
-  } 
-  else if (t == base + "/smart/set") {
-    if (batteryEnabled) {
-      if (p == "ON") { smartModeActive = true; scheduleOverride = false; } 
-      else { smartModeActive = false; }
-      saveSettings();
+
+  if (deviceMode == MODE_DIMMER) {
+    if (t == base + "/power/set") {
+      scheduleOverride = true;
+      if (p == "ON") { powerState = lastPowerState; pwmOveride = 0; }
+      else { powerState = 0; pwmOveride = 0; }
+      if (smartModeActive) { smartModeActive = false; saveSettings(); }
+      applyPowerState();
+    }
+    else if (t == base + "/pwm/set") {
+      scheduleOverride = true;
+      int val = p.toInt();
+      if (val < 0) val = 0; if (val > 255) val = 255;
+      if (val == 0) { powerState = 0; pwmOveride = 0; } else { currentPWM = val; pwmOveride = 1; }
+      if (smartModeActive) { smartModeActive = false; saveSettings(); }
+      applyPowerState();
+    }
+    else if (t == base + "/smart/set") {
+      if (batteryEnabled) {
+        if (p == "ON") { smartModeActive = true; scheduleOverride = false; }
+        else { smartModeActive = false; }
+        saveSettings();
+      }
+      applyPowerState();
     }
   }
-  applyPowerState();
+  else if (deviceMode == MODE_SWITCH) {
+    if (t == base + "/power/set") {
+      scheduleOverride = true;
+      switchOn = (p == "ON");
+      saveSettings();
+      applyOutput();
+    }
+  }
+  else { // MODE_SOLENOID
+    if (t == base + "/lock/set") {
+      if (p == "UNLOCK") triggerLatch();
+      else if (p == "LOCK") releaseLatch();
+    }
+  }
   syncState();
 }
 
@@ -351,7 +428,8 @@ void handleMQTT() {
         mqttClient.subscribe(String(getBaseTopic() + "/power/set").c_str());
         mqttClient.subscribe(String(getBaseTopic() + "/pwm/set").c_str());
         mqttClient.subscribe(String(getBaseTopic() + "/smart/set").c_str());
-        syncState(); 
+        mqttClient.subscribe(String(getBaseTopic() + "/lock/set").c_str());
+        syncState();
       } else {
         Serial.print("failed, rc="); Serial.println(mqttClient.state());
       }
@@ -362,15 +440,77 @@ void handleMQTT() {
 }
 
 // --- Device Control Logic ---
-void applyPowerState() {
+void writePwm(int duty, bool invert) {
+  if (duty < 0) duty = 0; if (duty > 255) duty = 255;
+  analogWrite(pwmPin, invert ? (255 - duty) : duty);
+}
+
+void applyPowerState() {  // Dimmer mode output
   if (pwmOveride == 0) {
     if (powerState == 1) currentPWM = pwmMin;
     else if (powerState == 2) currentPWM = pwmLow;
     else if (powerState == 3) currentPWM = pwmMed;
     else if (powerState == 4) currentPWM = pwmHigh;
-    else currentPWM = 0; 
+    else currentPWM = 0;
   }
-  analogWrite(pwmPin, currentPWM);
+  writePwm(currentPWM, false);
+}
+
+// Drive the physical pin to the correct level for the current mode/state.
+void applyOutput() {
+  if (deviceMode == MODE_SOLENOID) {
+    bool energ = (solActuation == 0) ? latchPulsing : latchEngaged;
+    writePwm(energ ? solLevel : 0, solActiveLow);
+  } else if (deviceMode == MODE_SWITCH) {
+    writePwm(switchOn ? 255 : 0, false);
+  } else {
+    applyPowerState();
+  }
+}
+
+void triggerLatch() {       // "unlock" / fire
+  scheduleOverride = true;
+  if (solActuation == 0) { latchPulsing = true; latchPulseStart = millis(); }
+  else { latchEngaged = true; latchEngageStart = millis(); }
+  applyOutput();
+  Serial.println("Latch triggered.");
+  syncState();
+}
+
+void releaseLatch() {       // "lock" / de-energize
+  scheduleOverride = true;
+  latchEngaged = false; latchPulsing = false;
+  applyOutput();
+  Serial.println("Latch released.");
+  syncState();
+}
+
+// Single source of truth for the JSON the web UI polls (mode-aware).
+String buildStateJson() {
+  String s = "{";
+  s += "\"mode\":" + String(deviceMode);
+  s += ",\"mqtt\":"; s += (mqttClient.connected() ? "true" : "false");
+  if (deviceMode == MODE_DIMMER) {
+    String pwrStr = (pwmOveride == 1) ? "MANUAL OVERRIDE" : (powerState == 0 ? "OFF" : (powerState == 1 ? "MIN" : (powerState == 2 ? "LOW" : (powerState == 3 ? "MED" : "HIGH"))));
+    s += ",\"state\":\"" + pwrStr + "\"";
+    s += ",\"pwm\":" + String(currentPWM);
+    s += ",\"smart\":"; s += (smartModeActive ? "true" : "false");
+  } else if (deviceMode == MODE_SWITCH) {
+    s += ",\"state\":\""; s += (switchOn ? "ON" : "OFF"); s += "\"";
+    s += ",\"sw\":"; s += (switchOn ? "true" : "false");
+    s += ",\"pwm\":" + String(switchOn ? 255 : 0);
+  } else { // MODE_SOLENOID
+    bool energ = (solActuation == 0) ? latchPulsing : latchEngaged;
+    s += ",\"state\":\""; s += (energ ? "UNLOCKED" : "LOCKED"); s += "\"";
+    s += ",\"latch\":"; s += (energ ? "true" : "false");
+    s += ",\"act\":" + String(solActuation);
+  }
+  if (batteryEnabled) {
+    s += ",\"bat_p\":" + String((int)currentBatteryPercentage);
+    s += ",\"bat_v\":" + String(currentBatteryVoltage, 2);
+  }
+  s += "}";
+  return s;
 }
 
 void triggerManualOverride() {
@@ -455,7 +595,14 @@ void setup() {
   loadNetworks();
   loadSettings();
   loadSchedule();
-  
+
+  // Existing installs (already have Wi-Fi saved) skip the first-run mode chooser.
+  if (!initialized && savedNetworks.size() > 0) { initialized = true; saveSettings(); }
+
+  // Drive the output to its correct, safe state for the configured mode
+  // (important for active-low solenoid drivers, which must idle de-energized).
+  applyOutput();
+
   mqttClient.setBufferSize(1024);
   if (mqttServer != "") mqttClient.setServer(mqttServer.c_str(), mqttPort);
   mqttClient.setCallback(mqttCallback);
@@ -488,17 +635,35 @@ void loop() {
   
   handleMQTT();
   
-  // 1. Handle Physical Button Input 
+  // 1. Handle Physical Button Input
   int buttonState = digitalRead(bootButtonPin);
   if (buttonState == LOW && (now - lastButtonMillis > debounceTime)) {
-    lastButtonMillis = now; 
-    triggerManualOverride();
-    powerState++;
-    if (powerState > 4) powerState = 0;
-    if (powerState != 0) lastPowerState = powerState;
-    pwmOveride = 0; 
-    applyPowerState();
-    syncState();
+    lastButtonMillis = now;
+    if (deviceMode == MODE_SOLENOID) {
+      if (solActuation == 1 && latchEngaged) releaseLatch();  // hold: toggle lock
+      else triggerLatch();                                    // pulse: fire, or hold: unlock
+    } else if (deviceMode == MODE_SWITCH) {
+      switchOn = !switchOn;
+      scheduleOverride = true; saveSettings(); applyOutput(); syncState();
+    } else {
+      triggerManualOverride();
+      powerState++;
+      if (powerState > 4) powerState = 0;
+      if (powerState != 0) lastPowerState = powerState;
+      pwmOveride = 0;
+      applyPowerState();
+      syncState();
+    }
+  }
+
+  // 1b. Handle non-blocking latch timers (pulse expiry + hold auto-relock)
+  if (deviceMode == MODE_SOLENOID) {
+    if (latchPulsing && (now - latchPulseStart >= (unsigned long)solPulseMs)) {
+      latchPulsing = false; applyOutput(); syncState();
+    }
+    if (latchEngaged && solHoldTimeout > 0 && (now - latchEngageStart >= (unsigned long)solHoldTimeout)) {
+      latchEngaged = false; applyOutput(); syncState();
+    }
   }
 
   // 2. Handle Schedule State Machine
@@ -521,27 +686,55 @@ void loop() {
         }
         if(targetAction == -1) targetAction = wrapAction;
 
-        if(targetAction != lastScheduledAction) {
-            lastScheduledAction = targetAction;
-            scheduleOverride = false; 
-            Serial.print("New schedule period triggered: Action "); Serial.println(targetAction);
-        }
+        bool batterySafe = !batteryEnabled || (currentBatteryPercentage > 15.0);
 
-        if(!scheduleOverride) {
-            bool batterySafe = !batteryEnabled || (batteryEnabled && currentBatteryPercentage > 15.0);
-            
-            if(!batterySafe) {
-                if(powerState != 0 || smartModeActive || pwmOveride != 0) {
-                    smartModeActive = false;
-                    powerState = 0; pwmOveride = 0; applyPowerState(); syncState();
+        if (deviceMode == MODE_SOLENOID && solActuation == 0) {
+            // Pulse latch: edge-triggered at the matching minute (don't replay stale events on catch-up).
+            bool matchNow = false;
+            for(auto& ev : schedule) {
+                if(ev.action == 20 && ev.h == ti->tm_hour && ev.m == ti->tm_min) {
+                    matchNow = true;
+                    if(batterySafe && curMins != lastPulseMinute) triggerLatch();
                 }
-            } else {
-                if(targetAction == 5 && batteryEnabled) {
-                    if(!smartModeActive) { smartModeActive = true; saveSettings(); syncState(); }
-                } else if (targetAction >= 0 && targetAction <= 4) {
-                    if(smartModeActive || powerState != targetAction || pwmOveride != 0) {
-                        smartModeActive = false;
-                        powerState = targetAction; pwmOveride = 0; applyPowerState(); syncState();
+            }
+            lastPulseMinute = matchNow ? curMins : -1;
+        } else {
+            // State-enforcing modes (dimmer, switch, solenoid-hold): catch up to the target state.
+            if(targetAction != lastScheduledAction) {
+                lastScheduledAction = targetAction;
+                scheduleOverride = false;
+                Serial.print("New schedule period triggered: Action "); Serial.println(targetAction);
+            }
+
+            if(!scheduleOverride) {
+                if(!batterySafe) {
+                    if(powerState != 0 || smartModeActive || pwmOveride != 0 || switchOn || latchEngaged) {
+                        smartModeActive = false; powerState = 0; pwmOveride = 0;
+                        switchOn = false; latchEngaged = false; latchPulsing = false;
+                        applyOutput(); syncState();
+                    }
+                } else if (deviceMode == MODE_DIMMER) {
+                    if(targetAction == 5 && batteryEnabled) {
+                        if(!smartModeActive) { smartModeActive = true; saveSettings(); syncState(); }
+                    } else if (targetAction >= 0 && targetAction <= 4) {
+                        if(smartModeActive || powerState != targetAction || pwmOveride != 0) {
+                            smartModeActive = false;
+                            powerState = targetAction; pwmOveride = 0; applyPowerState(); syncState();
+                        }
+                    }
+                } else if (deviceMode == MODE_SWITCH) {
+                    if(targetAction == 10 || targetAction == 11) {
+                        bool wantOn = (targetAction == 10);
+                        if(switchOn != wantOn) { switchOn = wantOn; saveSettings(); applyOutput(); syncState(); }
+                    }
+                } else if (deviceMode == MODE_SOLENOID) { // hold
+                    if(targetAction == 20 || targetAction == 21) {
+                        bool wantEngaged = (targetAction == 20);
+                        if(latchEngaged != wantEngaged) {
+                            latchEngaged = wantEngaged;
+                            if(wantEngaged) latchEngageStart = millis();
+                            applyOutput(); syncState();
+                        }
                     }
                 }
             }
@@ -570,7 +763,7 @@ void loop() {
         firstLogAdded = true;
       }
 
-      if (smartModeActive && currentBatteryPercentage > 0) {
+      if (deviceMode == MODE_DIMMER && smartModeActive && currentBatteryPercentage > 0) {
         int desiredState = 0;
         if (currentBatteryPercentage > 80.0) desiredState = 4;
         else if (currentBatteryPercentage > 50.0) desiredState = 3;
@@ -607,7 +800,7 @@ void loop() {
   if (Serial.available() > 0) {
     int input = Serial.parseInt();
     while (Serial.available() > 0) Serial.read(); 
-    if (input >= 0 && input <= 255) {
+    if (deviceMode == MODE_DIMMER && input >= 0 && input <= 255) {
       triggerManualOverride(); pwmOveride = 1; currentPWM = input; analogWrite(pwmPin, currentPWM); syncState();
     }
   }
@@ -631,7 +824,10 @@ void loop() {
     }
   } else if (!wifiWasConnected) {
     wifiWasConnected = true; attemptsInCurrentCycle = 0;
-    playWifiConnectSequence(); 
+    // The breathing animation drives the output pin — only safe for a dimmable load,
+    // not a latch/relay (it would actuate the solenoid on every Wi-Fi (re)connect).
+    if (deviceMode == MODE_DIMMER) playWifiConnectSequence();
+    else applyOutput();
     if (apActive) { WiFi.mode(WIFI_STA); apActive = false; }
   }
 
@@ -666,8 +862,14 @@ void loop() {
               int msStart = header.indexOf("&ms=") + 4; int msEnd = header.indexOf("&mpt=", msStart);
               int mptStart = header.indexOf("&mpt=") + 5; int mptEnd = header.indexOf("&mu=", mptStart);
               int muStart = header.indexOf("&mu=") + 4; int muEnd = header.indexOf("&mw=", muStart);
-              int mwStart = header.indexOf("&mw=") + 4; int mwEnd = header.indexOf(" HTTP", mwStart);
-              
+              int mwStart = header.indexOf("&mw=") + 4; int mwEnd = header.indexOf("&dm=", mwStart);
+              int dmStart = header.indexOf("&dm=") + 4; int dmEnd = header.indexOf("&sa=", dmStart);
+              int saStart = header.indexOf("&sa=") + 4; int saEnd = header.indexOf("&sp=", saStart);
+              int spStart = header.indexOf("&sp=") + 4; int spEnd = header.indexOf("&sh=", spStart);
+              int shStart = header.indexOf("&sh=") + 4; int shEnd = header.indexOf("&sl=", shStart);
+              int slStart = header.indexOf("&sl=") + 4; int slEnd = header.indexOf("&si=", slStart);
+              int siStart = header.indexOf("&si=") + 4; int siEnd = header.indexOf(" HTTP", siStart);
+
               sysName = urldecode(header.substring(nStart, nEnd));
               pageTitle = urldecode(header.substring(tStart, tEnd));
               otaPassword = urldecode(header.substring(opStart, opEnd));
@@ -687,22 +889,42 @@ void loop() {
               mqttPort = header.substring(mptStart, mptEnd).toInt();
               mqttUser = urldecode(header.substring(muStart, muEnd));
               mqttPass = urldecode(header.substring(mwStart, mwEnd));
-              
-              saveSettings(); setupOTA(); 
+
+              deviceMode = header.substring(dmStart, dmEnd).toInt();
+              if (deviceMode < 0 || deviceMode > 2) deviceMode = 0;
+              solActuation = header.substring(saStart, saEnd).toInt() == 1 ? 1 : 0;
+              solPulseMs = header.substring(spStart, spEnd).toInt(); if (solPulseMs < 10) solPulseMs = 10;
+              solHoldTimeout = header.substring(shStart, shEnd).toInt(); if (solHoldTimeout < 0) solHoldTimeout = 0;
+              solLevel = header.substring(slStart, slEnd).toInt();
+              if (solLevel < 0) solLevel = 0; if (solLevel > 255) solLevel = 255;
+              solActiveLow = header.substring(siStart, siEnd).toInt() == 1;
+
+              // Mode/solenoid params changed: reset latch state and schedule tracking, drive safe output.
+              latchEngaged = false; latchPulsing = false;
+              lastScheduledAction = -1; lastPulseMinute = -1;
+
+              saveSettings(); setupOTA(); applyOutput();
               if (mqttServer != "") mqttClient.setServer(mqttServer.c_str(), mqttPort);
-              if (mqttClient.connected()) mqttClient.disconnect(); 
-              lastMqttReconnectAttempt = 0; 
+              if (mqttClient.connected()) mqttClient.disconnect();
+              lastMqttReconnectAttempt = 0;
+              client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}");
+            }
+            // INITIALIZE / DEVICE MODE (first-run mode chooser)
+            else if (header.indexOf("GET /init?") >= 0) {
+              int mStart = header.indexOf("mode=") + 5; int mEnd = header.indexOf(" HTTP", mStart);
+              int m = header.substring(mStart, mEnd).toInt();
+              if (m < 0 || m > 2) m = 0;
+              deviceMode = m; initialized = true;
+              latchEngaged = false; latchPulsing = false;
+              lastScheduledAction = -1; lastPulseMinute = -1;
+              saveSettings(); applyOutput();
+              if (mqttClient.connected()) mqttClient.disconnect();
+              lastMqttReconnectAttempt = 0;
               client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}");
             }
             // LIVE STATE POLLING API
             else if (header.indexOf("GET /state HTTP") >= 0) {
-              String pwrStr = (pwmOveride == 1) ? "MANUAL OVERRIDE" : (powerState == 0 ? "OFF" : (powerState == 1 ? "MIN" : (powerState == 2 ? "LOW" : (powerState == 3 ? "MED" : "HIGH"))));
-              String smartStr = smartModeActive ? "true" : "false";
-              String mqttStr = mqttClient.connected() ? "true" : "false";
-              String json = "{\"state\":\"" + pwrStr + "\",\"pwm\":" + String(currentPWM) + ",\"smart\":" + smartStr + ",\"mqtt\":" + mqttStr;
-              if(batteryEnabled) { json += ",\"bat_p\":" + String((int)currentBatteryPercentage) + ",\"bat_v\":" + String(currentBatteryVoltage, 2); }
-              json += "}";
-              client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n" + json);
+              client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n" + buildStateJson());
             }
             // WI-FI MANAGER
             else if (header.indexOf("GET /add_wifi") >= 0) {
@@ -750,37 +972,47 @@ void loop() {
             }
             // DEVICE CONTROLS
             else if (header.indexOf("GET /device/") >= 0) {
-              triggerManualOverride(); 
-              if (header.indexOf("/smart") >= 0 && batteryEnabled) {
-                smartModeActive = !smartModeActive; saveSettings();
-                if (smartModeActive) { 
-                  int desiredState = 0;
-                  if (currentBatteryPercentage > 80.0) desiredState = 4;
-                  else if (currentBatteryPercentage > 50.0) desiredState = 3;
-                  else if (currentBatteryPercentage > 30.0) desiredState = 2;
-                  else if (currentBatteryPercentage > 15.0) desiredState = 1;
-                  powerState = desiredState; pwmOveride = 0; applyPowerState();
+              if (deviceMode == MODE_SOLENOID) {
+                if (header.indexOf("/unlock") >= 0) triggerLatch();
+                else if (header.indexOf("/lock") >= 0) releaseLatch();
+              }
+              else if (deviceMode == MODE_SWITCH) {
+                if (header.indexOf("/toggle") >= 0) switchOn = !switchOn;
+                else if (header.indexOf("/off") >= 0) switchOn = false;
+                else if (header.indexOf("/on") >= 0) switchOn = true;
+                scheduleOverride = true; saveSettings(); applyOutput();
+              }
+              else {
+                triggerManualOverride();
+                if (header.indexOf("/smart") >= 0 && batteryEnabled) {
+                  smartModeActive = !smartModeActive; saveSettings();
+                  if (smartModeActive) {
+                    int desiredState = 0;
+                    if (currentBatteryPercentage > 80.0) desiredState = 4;
+                    else if (currentBatteryPercentage > 50.0) desiredState = 3;
+                    else if (currentBatteryPercentage > 30.0) desiredState = 2;
+                    else if (currentBatteryPercentage > 15.0) desiredState = 1;
+                    powerState = desiredState; pwmOveride = 0; applyPowerState();
+                  }
+                }
+                else if (header.indexOf("/on") >= 0) { powerState = lastPowerState; pwmOveride = 0; applyPowerState(); }
+                else if (header.indexOf("/off") >= 0) { powerState = 0; pwmOveride = 0; applyPowerState(); }
+                else if (header.indexOf("/min") >= 0) { powerState = 1; lastPowerState = 1; pwmOveride = 0; applyPowerState(); }
+                else if (header.indexOf("/low") >= 0) { powerState = 2; lastPowerState = 2; pwmOveride = 0; applyPowerState(); }
+                else if (header.indexOf("/med") >= 0) { powerState = 3; lastPowerState = 3; pwmOveride = 0; applyPowerState(); }
+                else if (header.indexOf("/high") >= 0) { powerState = 4; lastPowerState = 4; pwmOveride = 0; applyPowerState(); }
+                else if (header.indexOf("/animate") >= 0) { playWifiConnectSequence(); }
+                else if (header.indexOf("/pwm?val=") >= 0) {
+                  int pwmStart = header.indexOf("val=") + 4; int pwmEnd = header.indexOf(" HTTP", pwmStart);
+                  int newVal = header.substring(pwmStart, pwmEnd).toInt();
+                  if (newVal < 0) newVal = 0; if (newVal > 255) newVal = 255;
+                  if (newVal == 0) { powerState = 0; pwmOveride = 0; } else { currentPWM = newVal; pwmOveride = 1; }
+                  analogWrite(pwmPin, currentPWM);
                 }
               }
-              else if (header.indexOf("/on") >= 0) { powerState = lastPowerState; pwmOveride = 0; applyPowerState(); }
-              else if (header.indexOf("/off") >= 0) { powerState = 0; pwmOveride = 0; applyPowerState(); }
-              else if (header.indexOf("/min") >= 0) { powerState = 1; lastPowerState = 1; pwmOveride = 0; applyPowerState(); }
-              else if (header.indexOf("/low") >= 0) { powerState = 2; lastPowerState = 2; pwmOveride = 0; applyPowerState(); }
-              else if (header.indexOf("/med") >= 0) { powerState = 3; lastPowerState = 3; pwmOveride = 0; applyPowerState(); }
-              else if (header.indexOf("/high") >= 0) { powerState = 4; lastPowerState = 4; pwmOveride = 0; applyPowerState(); }
-              else if (header.indexOf("/animate") >= 0) { playWifiConnectSequence(); }
-              else if (header.indexOf("/pwm?val=") >= 0) {
-                int pwmStart = header.indexOf("val=") + 4; int pwmEnd = header.indexOf(" HTTP", pwmStart);
-                int newVal = header.substring(pwmStart, pwmEnd).toInt();
-                if (newVal < 0) newVal = 0; if (newVal > 255) newVal = 255;
-                if (newVal == 0) { powerState = 0; pwmOveride = 0; } else { currentPWM = newVal; pwmOveride = 1; }
-                analogWrite(pwmPin, currentPWM);
-              }
               printNow = 1; syncState();
-              String stateStr = (pwmOveride == 1) ? "MANUAL OVERRIDE" : (powerState == 0 ? "OFF" : (powerState == 1 ? "MIN" : (powerState == 2 ? "LOW" : (powerState == 3 ? "MED" : "HIGH"))));
-              String smartStr = smartModeActive ? "true" : "false";
-              client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n{\"state\":\"" + stateStr + "\", \"pwm\":" + String(currentPWM) + ", \"smart\":" + smartStr + "}");
-            } 
+              client.print("HTTP/1.1 200 OK\r\nContent-type:application/json\r\nConnection: close\r\n\r\n" + buildStateJson());
+            }
             
             // --- WEB PAGES ---
             else if (header.indexOf("GET /schedule HTTP") >= 0) {
@@ -799,7 +1031,15 @@ void loop() {
               if (batteryEnabled && currentBatteryPercentage <= 15.0 && scheduleEnabled) {
                   batteryBanner = "<div style='background-color:#FF9800; color:#000; padding:10px; margin-bottom:15px; border-radius:5px; font-weight:bold;'>⚠️ Battery low (" + String((int)currentBatteryPercentage) + "%). Schedule paused until charged.</div>";
               }
-              String smartOption = batteryEnabled ? "<option value='5'>Battery Smart Mode</option>" : "";
+              String actionOpts;
+              if (deviceMode == MODE_SOLENOID) {
+                actionOpts = "<option value='20'>Unlock / Trigger</option><option value='21'>Lock</option>";
+              } else if (deviceMode == MODE_SWITCH) {
+                actionOpts = "<option value='10'>Switch ON</option><option value='11'>Switch OFF</option>";
+              } else {
+                String smartOption = batteryEnabled ? "<option value='5'>Battery Smart Mode</option>" : "";
+                actionOpts = smartOption + "<option value='4'>Power: HIGH</option><option value='3'>Power: MED</option><option value='2'>Power: LOW</option><option value='1'>Power: MIN</option><option value='0'>Turn OFF</option>";
+              }
 
               client.print("HTTP/1.1 200 OK\r\nContent-type:text/html\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n");
               String schedTemplate = R"rawliteral(
@@ -834,14 +1074,7 @@ void loop() {
   <hr style="border: 0; height: 1px; background-color: #555; margin: 30px 10%; max-width: 350px; margin-left: auto; margin-right: auto;">
   <p>Add a new event:</p>
   <input type='time' id='time' required>
-  <select id='action'>
-    %SMART_OPT%
-    <option value='4'>Power: HIGH</option>
-    <option value='3'>Power: MED</option>
-    <option value='2'>Power: LOW</option>
-    <option value='1'>Power: MIN</option>
-    <option value='0'>Turn OFF</option>
-  </select><br><br>
+  <select id='action'>%ACTION_OPTS%</select><br><br>
   <button class='btn' onclick='addSched()'>Add Event</button><br>
   <a href='/'><button class='btn btn-back'>&#x1F519;&#xFE0E; Back</button></a>
 </body>
@@ -852,7 +1085,7 @@ void loop() {
               schedTemplate.replace("%MASTER_CLASS%", masterBtnClass);
               schedTemplate.replace("%MASTER_TEXT%", masterBtnText);
               schedTemplate.replace("%BANNER_PLACEHOLDER%", batteryBanner);
-              schedTemplate.replace("%SMART_OPT%", smartOption);
+              schedTemplate.replace("%ACTION_OPTS%", actionOpts);
               client.print(schedTemplate);
             }
             else if (header.indexOf("GET /history HTTP") >= 0 && batteryEnabled) {
@@ -998,9 +1231,13 @@ void loop() {
       let me = document.getElementById('mqtten').checked ? 1 : 0;
       let ms = encodeURIComponent(document.getElementById('mqttsrv').value); let mpt = document.getElementById('mqttprt').value;
       let mu = encodeURIComponent(document.getElementById('mqttusr').value); let mw = encodeURIComponent(document.getElementById('mqttpwd').value);
-      
+      let dm = document.getElementById('devmode').value;
+      let sa = document.getElementById('solact').value; let sp = document.getElementById('solpulse').value;
+      let sh = document.getElementById('solhold').value; let sl = document.getElementById('sollvl').value;
+      let si = document.getElementById('solinv').checked ? 1 : 0;
+
       document.getElementById('sys-status').innerText = 'Saving...';
-      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&up=' + up + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as + '&me=' + me + '&ms=' + ms + '&mpt=' + mpt + '&mu=' + mu + '&mw=' + mw)
+      fetch('/update_sys?n=' + n + '&t=' + t + '&op=' + op + '&b=' + b + '&up=' + up + '&p1=' + p1 + '&p2=' + p2 + '&p3=' + p3 + '&p4=' + p4 + '&bd=' + bd + '&bc=' + bc + '&ap=' + ap + '&as=' + as + '&me=' + me + '&ms=' + ms + '&mpt=' + mpt + '&mu=' + mu + '&mw=' + mw + '&dm=' + dm + '&sa=' + sa + '&sp=' + sp + '&sh=' + sh + '&sl=' + sl + '&si=' + si)
         .then(res => res.json()).then(data => { document.getElementById('sys-status').innerText = 'Saved!'; setTimeout(()=>location.reload(), 500); });
     }
 
@@ -1019,6 +1256,14 @@ void loop() {
 </head>
 <body>
   <h2>System Configuration</h2>
+  <div class='card'>
+    <label>Device Mode:</label><br>
+    <select id='devmode' style='padding:10px; border-radius:5px; width:85%; max-width:300px;'>
+      <option value='0' %DM0%>Dimmer (PWM)</option>
+      <option value='1' %DM1%>Solenoid / Latch</option>
+      <option value='2' %DM2%>On / Off Switch</option>
+    </select>
+  </div>
   <div class='card'>
     <label>Device Name (OTA/MQTT Name):</label><br><input type='text' id='sysname' value="%SYS_NAME%"><br><br>
     <label>OTA Password:</label><br><input type='text' id='otapass' value="%OTA_PASS%"><br><br>
@@ -1042,6 +1287,21 @@ void loop() {
     <p style="margin-bottom:5px;">Animation Tuning</p>
     <div class='row'><span>Peak Power (0-255):</span><input type='number' id='animpwm' value="%ANIM_PWM%" min="0" max="255"></div>
     <div class='row'><span>Speed (ms per step):</span><input type='number' id='animspd' value="%ANIM_SPD%" min="1" max="255"></div>
+  </div>
+
+  <h2>Solenoid / Latch</h2>
+  <div class='card'>
+    <p style="margin-top:0; color:#aaa; font-size:13px;">Applies when Device Mode is Solenoid / Latch.</p>
+    <label>Actuation:</label><br>
+    <select id='solact' style='padding:10px; border-radius:5px;'>
+      <option value='0' %SA0%>Momentary Pulse</option>
+      <option value='1' %SA1%>Sustained Hold</option>
+    </select>
+    <hr style="border: 0; height: 1px; background-color: #555; margin: 15px 0;">
+    <div class='row'><span>Pulse duration (ms):</span><input type='number' id='solpulse' value="%SOL_PULSE%" min="10" max="60000"></div>
+    <div class='row'><span>Hold auto-relock (ms, 0=off):</span><input type='number' id='solhold' value="%SOL_HOLD%" min="0" max="600000"></div>
+    <div class='row'><span>Energize level (0-255):</span><input type='number' id='sollvl' value="%SOL_LVL%" min="0" max="255"></div>
+    <label style="display:block; margin-top:10px;"><input type='checkbox' id='solinv' %SOL_INV%> Active-low output (inverting driver)</label>
   </div>
 
   <h2>MQTT Broker</h2>
@@ -1096,8 +1356,150 @@ void loop() {
               settingsTemplate.replace("%MQTT_USR%", mqttUser);
               settingsTemplate.replace("%MQTT_PWD%", mqttPass);
               settingsTemplate.replace("%NW_LIST%", networkListHTML);
+              settingsTemplate.replace("%DM0%", deviceMode == 0 ? "selected" : "");
+              settingsTemplate.replace("%DM1%", deviceMode == 1 ? "selected" : "");
+              settingsTemplate.replace("%DM2%", deviceMode == 2 ? "selected" : "");
+              settingsTemplate.replace("%SA0%", solActuation == 0 ? "selected" : "");
+              settingsTemplate.replace("%SA1%", solActuation == 1 ? "selected" : "");
+              settingsTemplate.replace("%SOL_PULSE%", String(solPulseMs));
+              settingsTemplate.replace("%SOL_HOLD%", String(solHoldTimeout));
+              settingsTemplate.replace("%SOL_LVL%", String(solLevel));
+              settingsTemplate.replace("%SOL_INV%", solActiveLow ? "checked" : "");
               client.print(settingsTemplate);
             } 
+            // ROOT: first-run mode chooser (shown until a mode is picked)
+            else if ((header.indexOf("GET / HTTP") >= 0 || header.indexOf("GET /? HTTP") >= 0) && !initialized) {
+              client.print("HTTP/1.1 200 OK\r\nContent-type:text/html\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n");
+              String t = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>%PAGE_TITLE% Setup</title>
+<style>
+body{font-family:Helvetica;text-align:center;background:#121212;color:#fff;padding-top:30px;}
+.card{background:#1e1e1e;padding:20px;margin:20px auto;border-radius:12px;max-width:360px;}
+.btn{border:none;color:#fff;padding:18px 16px;font-size:18px;margin:8px 0;cursor:pointer;border-radius:10px;width:90%;}
+.btn-g{background:#4CAF50;}.btn-p{background:#9C27B0;}.btn-b{background:#2196F3;}.btn-s{background:#555;}
+.sub{color:#aaa;font-size:13px;}
+</style>
+<script>function pick(m){fetch('/init?mode='+m).then(r=>r.json()).then(d=>{location.href='/';});}</script>
+</head><body>
+<h1>%SYS_NAME%</h1>
+<p class='sub'>First-time setup &mdash; what does this device control?</p>
+<div class='card'>
+<button class='btn btn-g' onclick='pick(0)'>&#x1F4A1; Dimmer (PWM)<br><span class='sub'>Lights, pumps, fans, motors</span></button>
+<button class='btn btn-p' onclick='pick(1)'>&#x1F512; Solenoid / Latch<br><span class='sub'>Door strike, latch, lock</span></button>
+<button class='btn btn-b' onclick='pick(2)'>&#x1F50C; On / Off Switch<br><span class='sub'>Simple relay</span></button>
+</div>
+<p class='sub'>You can change this later in Config.</p>
+<a href='/settings'><button class='btn btn-s' style='width:auto; padding:12px 24px;'>&#x2699;&#xFE0E; Wi-Fi / Config</button></a>
+</body></html>
+)rawliteral";
+              t.replace("%PAGE_TITLE%", pageTitle);
+              t.replace("%SYS_NAME%", sysName);
+              client.print(t);
+            }
+            // ROOT: On/Off Switch dashboard
+            else if ((header.indexOf("GET / HTTP") >= 0 || header.indexOf("GET /? HTTP") >= 0) && deviceMode == MODE_SWITCH) {
+              String powerBtn = switchOn ? "<button class=\"btn btn-off\" onclick=\"cmd('/device/off')\">Turn OFF</button>" : "<button class=\"btn btn-blue\" onclick=\"cmd('/device/on')\">Turn ON</button>";
+              String mqttDisp = mqttEnabled ? "" : "display:none;";
+              String mqttStatusText = mqttClient.connected() ? "<span style='color:#4CAF50;'>MQTT Connected</span>" : "<span style='color:#f44336;'>MQTT Disconnected</span>";
+              String battNav = batteryEnabled ? "" : "display:none;";
+              client.print("HTTP/1.1 200 OK\r\nContent-type:text/html\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n");
+              String t = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>%PAGE_TITLE%</title>
+<style>
+body{font-family:Helvetica;text-align:center;background:#121212;color:#fff;padding-top:20px;}
+.btn{background:#4CAF50;border:none;color:#fff;padding:18px 40px;font-size:22px;margin:10px;cursor:pointer;border-radius:10px;}
+.btn-off{background:#f44336;}.btn-blue{background:#2196F3;}
+.nav-btn{background:#333;padding:12px 24px;font-size:14px;border-radius:20px;margin:8px;color:#fff;text-decoration:none;display:inline-block;}
+hr{border:0;height:1px;background:#555;margin:30px 10%;}
+</style>
+<script>
+function handle(d){var p=document.getElementById('power-container');document.getElementById('state-display').innerText=d.state;
+if(d.sw)p.innerHTML='<button class="btn btn-off" onclick="cmd(\'/device/off\')">Turn OFF</button>';
+else p.innerHTML='<button class="btn btn-blue" onclick="cmd(\'/device/on\')">Turn ON</button>';
+var st=document.getElementById('mqtt-live-status');if(st){st.innerHTML=d.mqtt?"<span style='color:#4CAF50;'>MQTT Connected</span>":"<span style='color:#f44336;'>MQTT Disconnected</span>";}}
+function cmd(u){fetch(u).then(r=>r.json()).then(handle);}
+setInterval(function(){fetch('/state').then(r=>r.json()).then(handle).catch(e=>{});},2500);
+</script></head><body>
+<h1>%SYS_NAME%</h1>
+<div style='%MQTT_DISP%'><div id='mqtt-live-status' style='font-size:12px;font-weight:bold;margin-bottom:20px;'>%MQTT_STATUS%</div></div>
+<h3>State: <strong id='state-display'>%STATE%</strong></h3>
+<div id='power-container'>%POWER%</div>
+<hr>
+<a href='/schedule' class='nav-btn'>&#x1F4C5;&#xFE0E; Daily Schedule</a>
+<a href='/history' class='nav-btn' style='%BATT_NAV%'>&#x1F50B;&#xFE0E; Battery History</a>
+<a href='/settings' class='nav-btn'>&#x2699;&#xFE0E; Config</a>
+</body></html>
+)rawliteral";
+              t.replace("%PAGE_TITLE%", pageTitle);
+              t.replace("%SYS_NAME%", sysName);
+              t.replace("%STATE%", switchOn ? "ON" : "OFF");
+              t.replace("%POWER%", powerBtn);
+              t.replace("%MQTT_DISP%", mqttDisp);
+              t.replace("%MQTT_STATUS%", mqttStatusText);
+              t.replace("%BATT_NAV%", battNav);
+              client.print(t);
+            }
+            // ROOT: Solenoid / Latch dashboard
+            else if ((header.indexOf("GET / HTTP") >= 0 || header.indexOf("GET /? HTTP") >= 0) && deviceMode == MODE_SOLENOID) {
+              bool energ = (solActuation == 0) ? latchPulsing : latchEngaged;
+              String controls, hint;
+              if (solActuation == 0) {
+                controls = "<button class='btn btn-purple' onclick=\"cmd('/device/unlock')\">&#x1F513; Trigger</button>";
+                hint = "Momentary pulse: " + String(solPulseMs) + " ms";
+              } else {
+                controls = "<button class='btn btn-blue' onclick=\"cmd('/device/unlock')\">&#x1F513; Unlock</button> <button class='btn btn-off' onclick=\"cmd('/device/lock')\">&#x1F512; Lock</button>";
+                hint = solHoldTimeout > 0 ? ("Sustained hold &mdash; auto-relock after " + String(solHoldTimeout) + " ms") : "Sustained hold until locked";
+              }
+              String mqttDisp = mqttEnabled ? "" : "display:none;";
+              String mqttStatusText = mqttClient.connected() ? "<span style='color:#4CAF50;'>MQTT Connected</span>" : "<span style='color:#f44336;'>MQTT Disconnected</span>";
+              String battNav = batteryEnabled ? "" : "display:none;";
+              client.print("HTTP/1.1 200 OK\r\nContent-type:text/html\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n");
+              String t = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>%PAGE_TITLE%</title>
+<style>
+body{font-family:Helvetica;text-align:center;background:#121212;color:#fff;padding-top:20px;}
+.btn{background:#4CAF50;border:none;color:#fff;padding:18px 30px;font-size:20px;margin:8px;cursor:pointer;border-radius:10px;}
+.btn-off{background:#f44336;}.btn-blue{background:#2196F3;}.btn-purple{background:#9C27B0;}
+.nav-btn{background:#333;padding:12px 24px;font-size:14px;border-radius:20px;margin:8px;color:#fff;text-decoration:none;display:inline-block;}
+.status{font-size:42px;font-weight:bold;margin:20px;}
+.locked{color:#f44336;}.unlocked{color:#4CAF50;}
+hr{border:0;height:1px;background:#555;margin:30px 10%;}
+.sub{color:#aaa;font-size:14px;}
+</style>
+<script>
+var ACT=%ACT%;
+function handle(d){var s=document.getElementById('state-display');s.innerText=d.state;s.className='status '+(d.latch?'unlocked':'locked');
+var st=document.getElementById('mqtt-live-status');if(st){st.innerHTML=d.mqtt?"<span style='color:#4CAF50;'>MQTT Connected</span>":"<span style='color:#f44336;'>MQTT Disconnected</span>";}}
+function cmd(u){fetch(u).then(r=>r.json()).then(function(d){handle(d);if(ACT==0){var s=document.getElementById('state-display');s.innerText='TRIGGERED';s.className='status unlocked';}});}
+setInterval(function(){fetch('/state').then(r=>r.json()).then(handle).catch(e=>{});},2500);
+</script></head><body>
+<h1>%SYS_NAME%</h1>
+<div style='%MQTT_DISP%'><div id='mqtt-live-status' style='font-size:12px;font-weight:bold;margin-bottom:10px;'>%MQTT_STATUS%</div></div>
+<div id='state-display' class='status %STATE_CLASS%'>%STATE%</div>
+<div>%CONTROLS%</div>
+<p class='sub'>%HINT%</p>
+<hr>
+<a href='/schedule' class='nav-btn'>&#x1F4C5;&#xFE0E; Daily Schedule</a>
+<a href='/history' class='nav-btn' style='%BATT_NAV%'>&#x1F50B;&#xFE0E; Battery History</a>
+<a href='/settings' class='nav-btn'>&#x2699;&#xFE0E; Config</a>
+</body></html>
+)rawliteral";
+              t.replace("%PAGE_TITLE%", pageTitle);
+              t.replace("%SYS_NAME%", sysName);
+              t.replace("%ACT%", String(solActuation));
+              t.replace("%STATE_CLASS%", energ ? "unlocked" : "locked");
+              t.replace("%STATE%", energ ? "UNLOCKED" : "LOCKED");
+              t.replace("%CONTROLS%", controls);
+              t.replace("%HINT%", hint);
+              t.replace("%MQTT_DISP%", mqttDisp);
+              t.replace("%MQTT_STATUS%", mqttStatusText);
+              t.replace("%BATT_NAV%", battNav);
+              client.print(t);
+            }
+            // ROOT: Dimmer (PWM) dashboard
             else if (header.indexOf("GET / HTTP") >= 0 || header.indexOf("GET /? HTTP") >= 0) {
               String stateStr = (pwmOveride == 1) ? "MANUAL OVERRIDE" : (powerState == 0 ? "OFF" : (powerState == 1 ? "MIN" : (powerState == 2 ? "LOW" : (powerState == 3 ? "MED" : "HIGH"))));
               String powerBtn = (powerState == 0 && currentPWM == 0) ? "<button class=\"btn btn-blue\" style=\"margin:0;\" onclick=\"sendCommand('/device/on')\">Turn ON</button>" : "<button class=\"btn btn-off\" style=\"margin:0;\" onclick=\"sendCommand('/device/off')\">Turn OFF</button>";

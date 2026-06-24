@@ -1,9 +1,11 @@
 # Universal ESP32 Wireless Control Platform
 
-A robust, generalized IoT platform for controlling PWM-driven devices (lights, pumps, motors, fans) with built-in battery management, daily scheduling, an interactive offline-capable web dashboard, and zero-configuration Home Assistant MQTT integration.
+A robust, generalized IoT platform for controlling PWM-driven devices (lights, pumps, motors, fans), solenoid latches, and simple on/off loads — with built-in battery management, daily scheduling, an interactive offline-capable web dashboard, and zero-configuration Home Assistant MQTT integration.
 
 ## 🌟 Features
 
+* **Selectable Device Modes:** On first power-up the device asks what it controls — a **Dimmer** (PWM), a **Solenoid / Latch**, or a simple **On/Off Switch**. The dashboard, scheduler, and Home Assistant entity all adapt to the chosen mode, which can be changed any time from the Config page.
+* **Solenoid / Latch Control:** Drives door strikes, latches, and locks with either a configurable **momentary pulse** (auto-release — the safe default for latches) or a **sustained hold** (with optional auto-relock timeout). Triggerable from the web button, the physical button, the daily schedule, and Home Assistant (as an MQTT lock entity).
 * **Locally Hosted Web Dashboard:** A sleek, responsive UI with zero external internet dependencies. Features a native HTML5 Canvas engine for zooming and panning battery history graphs, and background AJAX polling so the page updates in real-time without refreshing.
 * **Home Assistant Auto-Discovery (MQTT):** Seamlessly integrates into your smart home. Just enter your broker credentials, and the ESP32 will automatically build its own Light, Switch, and Sensor entities inside Home Assistant.
 * **Battery Smart Mode:** Automatically scales device power based on the real-time battery voltage to protect battery chemistry and maximize runtime. Includes configurable 0% and 100% voltage thresholds for custom battery types (AGM, LiFePO4, etc.).
@@ -21,12 +23,25 @@ A robust, generalized IoT platform for controlling PWM-driven devices (lights, p
 * **Voltage Divider:** Designed for a 1/5th reduction (e.g., four 1MΩ resistors in series to the battery positive, one 1MΩ resistor to ground).
 * **Power Output:** Logic-level MOSFET or Motor Driver attached to the PWM pin.
 * **Manual Override:** Physical momentary push button.
+* **Solenoid / Latch (optional):** Any solenoid, electric strike, or relay driven through a logic-level MOSFET on the output pin, **with a flyback diode across the coil** (see [Solenoid Wiring & Flyback Diode](#solenoid-wiring--flyback-diode)). For active-low relay/driver boards, enable **Active-low output** in the Solenoid config.
 
 ### Pinout / Wiring
 * **I2C SDA / SCL:** Default ESP32 I2C pins -> ADS1115 SDA/SCL
 * **ADS1115 A0:** Connected to the center of the 1/5th Voltage Divider measuring the battery.
-* **PWM Output Pin:** `GPIO 4` (Configurable in code as `pwmPin`)
-* **Manual Button Pin:** `GPIO 9` (Configurable in code as `bootButtonPin`, wired to switch to GND).
+* **Output Pin:** `GPIO 4` (Configurable in code as `pwmPin`) — drives the dimmer, solenoid, or switch load depending on the selected Device Mode.
+* **Manual Button Pin:** `GPIO 9` (Configurable in code as `bootButtonPin`, wired to switch to GND). On the ESP32-S3/C3 this is the onboard BOOT button.
+
+### Solenoid Wiring & Flyback Diode
+
+A solenoid/relay coil is an inductive load: when the MOSFET switches off, the collapsing magnetic field produces a large reverse-voltage spike that **will destroy the MOSFET** unless a **flyback (freewheeling) diode** clamps it.
+
+* **Placement & orientation:** Wire the diode directly across the coil terminals, **reverse-biased** — **cathode (banded end) to the +V supply** side of the coil, **anode to the MOSFET-drain / low side**. It stays off in normal operation and only conducts the kickback when the coil de-energizes. Mount it physically close to the coil.
+* **On/off latches (default — Energize level = 255):** a standard rectifier is fine:
+  * **1N4007** (1000 V, 1 A) — small 12 V coils drawing up to ~0.75 A.
+  * **1N5408** (1000 V, 3 A) — larger / higher-current solenoids.
+* **PWM hold (Energize level < 255):** the 1N400x series is too slow for PWM switching and will run hot — use a **Schottky** (**1N5822**, 3 A, or **SS34**) or **fast-recovery** (**UF4007**) diode instead.
+* **Sizing rule of thumb:** forward-current rating ≥ the coil's steady current; reverse-voltage rating ≥ ~2× the supply voltage (a 1N4007's 1000 V is comfortable for a 12 V system).
+* **Pre-protected boards:** most relay-module and motor-driver breakout boards already include the flyback diode on-board — if you're using one, you don't need to add another.
 
 ---
 
@@ -51,15 +66,24 @@ To compile this project, you will need the **Arduino IDE** with the **ESP32 Boar
 1. Once powered on, if the ESP32 cannot find a saved Wi-Fi network, it will broadcast its own network.
 2. Connect your phone or computer to the Wi-Fi network named **`Wireless Control Setup`** (Password: `password123`).
 3. Open a web browser and navigate to **`http://192.168.4.1`**.
-4. Click on **⚙️ Config**.
+4. **Choose your Device Mode** on the first-run welcome screen — **Dimmer**, **Solenoid / Latch**, or **On/Off Switch**. (You can change this later from Config.)
+5. Click on **⚙️ Config** to set up Wi-Fi and tune the rest.
 
 ### 3. System Tuning (The Settings Page)
 On the Configuration page, you can tailor the platform entirely to your specific hardware:
 
 **System Identity**
+* **Device Mode:** Switch between **Dimmer (PWM)**, **Solenoid / Latch**, and **On/Off Switch** at any time.
 * **Device Name:** What you want the device to be called. This automatically becomes your OTA hostname and the root topic for MQTT (e.g., "Patio Lights" becomes `patio-lights`).
 * **OTA Password:** Secure your over-the-air update port.
 * **Web Page Title:** The text displayed on your browser tab.
+
+**Solenoid / Latch (used in Solenoid mode)**
+* **Actuation:** **Momentary Pulse** (energize, then auto-release) or **Sustained Hold** (energize until locked).
+* **Pulse duration (ms):** How long the coil is energized for a pulse.
+* **Hold auto-relock (ms):** Optional safety timeout for Hold mode (`0` = stay unlocked until told to lock).
+* **Energize level (0-255):** Drive strength applied while energized (255 = full on).
+* **Active-low output:** Invert the pin for relay/driver boards that energize on a LOW signal.
 
 **UI & Hardware Config**
 * **Enable Battery Management:** Toggle the ADC polling and battery failsafes on or off.
@@ -83,17 +107,18 @@ On the Configuration page, you can tailor the platform entirely to your specific
 
 This platform features **Zero-Configuration MQTT Auto-Discovery**. 
 
-Once you enter your MQTT credentials in the web dashboard and save, the ESP32 will immediately connect to your broker and broadcast its configuration payloads. It will automatically appear in your Home Assistant Devices list featuring:
-1. **A Light Entity:** For turning the device ON/OFF and controlling the brightness slider.
-2. **A Switch Entity:** For toggling the Battery Smart Mode.
-3. **Sensor Entities:** Real-time Battery Percentage and Voltage readouts.
+Once you enter your MQTT credentials in the web dashboard and save, the ESP32 will immediately connect to your broker and broadcast its configuration payloads. The **primary entity matches the selected Device Mode**:
+1. **Dimmer mode → a Light Entity:** For turning the device ON/OFF and controlling the brightness slider. Also exposes a **Switch Entity** for toggling Battery Smart Mode.
+2. **Solenoid mode → a Lock Entity:** `UNLOCK` triggers the latch (pulse or hold) and `LOCK` releases it.
+3. **Switch mode → a Switch Entity:** Simple ON/OFF.
+4. **Sensor Entities:** Real-time Battery Percentage and Voltage readouts (in any mode, when Battery Management is enabled).
 
-Whenever a change is made locally (via the physical button, the web dashboard, or the daily schedule), the device will instantly push the new state to Home Assistant in real-time.
+Switching modes automatically removes the old entity from Home Assistant and publishes the new one. Whenever a change is made locally (via the physical button, the web dashboard, or the daily schedule), the device will instantly push the new state to Home Assistant in real-time.
 
 ---
 
 ## 📅 Managing the Schedule
 
-The Daily Routine page allows you to set actions for specific times. 
-* **Catch-Up Logic:** If the device loses power or is manually overridden, it will constantly evaluate the schedule and snap back to the intended state as soon as it is safe to do so.
+The Daily Routine page allows you to set actions for specific times. The available actions adapt to the Device Mode — power levels (OFF/MIN/LOW/MED/HIGH/Smart) in Dimmer mode, **Switch ON/OFF** in Switch mode, and **Unlock/Trigger** & **Lock** in Solenoid mode.
+* **Catch-Up Logic:** If the device loses power or is manually overridden, it will constantly evaluate the schedule and snap back to the intended state as soon as it is safe to do so. (Solenoid **pulse** actions are edge-triggered — they fire once at the scheduled time rather than being continuously re-applied.)
 * **Battery Failsafe:** If Battery Management is enabled, the scheduler enforces a 15% failsafe. If the battery drops below this threshold, scheduled power-on events will be paused to protect the battery until it charges.
