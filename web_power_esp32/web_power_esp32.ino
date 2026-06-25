@@ -54,9 +54,10 @@ bool firstLogAdded = false;
 
 // --- ADC Variables ---
 unsigned long lastADCMillis = 0;
-const long adcInterval = 5000; 
+const long adcInterval = 5000;
 float currentBatteryPercentage = 0.0;
-float currentBatteryVoltage = 0.0; 
+float currentBatteryVoltage = 0.0;
+bool adcReady = false;  // true once the ADS1115 is detected on I2C; guards a blocking read
 
 // --- Schedule Variables ---
 struct SchedEvent {
@@ -719,9 +720,10 @@ void setup() {
   }
   
   if (batteryEnabled) {
-    ads.setGain(GAIN_ONE); 
+    ads.setGain(GAIN_ONE);
     delay(200);
-    ads.begin();
+    adcReady = ads.begin();  // false if the ADS1115 isn't on the bus
+    if (!adcReady) Serial.println("ADS1115 not found - battery readings paused until detected.");
     loadBatteryLogs();
   }
   
@@ -847,43 +849,48 @@ void loop() {
   if (batteryEnabled) {
     if (now - lastADCMillis >= adcInterval) {
       lastADCMillis = now;
-      int16_t adc0 = ads.readADC_SingleEnded(0);
-      float adcVolts = ads.computeVolts(adc0);
-      currentBatteryVoltage = adcVolts * 5.0; 
-      
-      if (batCharged > batDischarged) {
-        currentBatteryPercentage = ((currentBatteryVoltage - batDischarged) / (batCharged - batDischarged)) * 100.0;
-      } else { currentBatteryPercentage = 0.0; }
+      if (!adcReady) { ads.setGain(GAIN_ONE); adcReady = ads.begin(); }  // keep probing for the ADS1115
 
-      if (currentBatteryPercentage > 100.0) currentBatteryPercentage = 100.0;
-      if (currentBatteryPercentage < 0) currentBatteryPercentage = 0;
-      
-      if (!firstLogAdded) {
-        addBatteryLog(currentBatteryPercentage);
-        firstLogAdded = true;
-      }
+      // Only read when the chip is present: readADC_SingleEnded() blocks forever if it isn't.
+      if (adcReady) {
+        int16_t adc0 = ads.readADC_SingleEnded(0);
+        float adcVolts = ads.computeVolts(adc0);
+        currentBatteryVoltage = adcVolts * 5.0;
 
-      if (deviceMode == MODE_DIMMER && smartModeActive && currentBatteryPercentage > 0) {
-        int desiredState = 0;
-        if (currentBatteryPercentage > 80.0) desiredState = 4;
-        else if (currentBatteryPercentage > 50.0) desiredState = 3;
-        else if (currentBatteryPercentage > 30.0) desiredState = 2;
-        else if (currentBatteryPercentage > 15.0) desiredState = 1;
-        else desiredState = 0; 
+        if (batCharged > batDischarged) {
+          currentBatteryPercentage = ((currentBatteryVoltage - batDischarged) / (batCharged - batDischarged)) * 100.0;
+        } else { currentBatteryPercentage = 0.0; }
 
-        if (powerState != desiredState || pwmOveride != 0) {
-          powerState = desiredState; pwmOveride = 0;
-          applyPowerState(); syncState();
+        if (currentBatteryPercentage > 100.0) currentBatteryPercentage = 100.0;
+        if (currentBatteryPercentage < 0) currentBatteryPercentage = 0;
+
+        if (!firstLogAdded) {
+          addBatteryLog(currentBatteryPercentage);
+          firstLogAdded = true;
+        }
+
+        if (deviceMode == MODE_DIMMER && smartModeActive && currentBatteryPercentage > 0) {
+          int desiredState = 0;
+          if (currentBatteryPercentage > 80.0) desiredState = 4;
+          else if (currentBatteryPercentage > 50.0) desiredState = 3;
+          else if (currentBatteryPercentage > 30.0) desiredState = 2;
+          else if (currentBatteryPercentage > 15.0) desiredState = 1;
+          else desiredState = 0;
+
+          if (powerState != desiredState || pwmOveride != 0) {
+            powerState = desiredState; pwmOveride = 0;
+            applyPowerState(); syncState();
+          }
         }
       }
     }
 
-    // 4. Handle Battery Logging
-    if (now - lastShortTermLogMillis >= 300000) { 
+    // 4. Handle Battery Logging (only meaningful once the ADC is live)
+    if (adcReady && now - lastShortTermLogMillis >= 300000) {
       addBatteryLog(currentBatteryPercentage);
       lastShortTermLogMillis = now;
     }
-    if (now - lastLongTermLogMillis >= 900000) { 
+    if (adcReady && now - lastLongTermLogMillis >= 900000) {
       saveBatteryLogs();
       lastLongTermLogMillis = now;
     }
