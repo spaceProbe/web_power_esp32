@@ -21,7 +21,7 @@ A robust, generalized IoT platform for controlling PWM-driven devices (lights, p
 
 * **Microcontroller:** ESP32 Development Board
 * **ADC:** Adafruit ADS1115 16-Bit I2C ADC
-* **Voltage Divider:** Designed for a 1/5th reduction (e.g., four 1MΩ resistors in series to the battery positive, one 1MΩ resistor to ground).
+* **Voltage Divider:** Designed for a 1/5th reduction, e.g. 39kΩ + 1kΩ in series to the battery positive and 10kΩ to ground (1% parts). Keep the divider's source resistance low (≲10kΩ): the ADS1115's input impedance is only ~6MΩ at this gain, so a 1MΩ-class divider (e.g. four 1MΩ over one 1MΩ) reads about 12% low. The ADS1115's inputs must also stay below its supply (3.3V), so with ×5 the battery may be at most ~16V.
 * **Power Output:** Logic-level MOSFET or Motor Driver attached to the PWM pin.
 * **Manual Override:** Physical momentary push button.
 * **Solenoid / Latch (optional):** Any solenoid, electric strike, or relay driven through a logic-level MOSFET on the output pin, **with a flyback diode across the coil** (see [Solenoid Wiring & Flyback Diode](#solenoid-wiring--flyback-diode)). For active-low relay/driver boards, enable **Active-low output** in the Solenoid config.
