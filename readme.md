@@ -27,7 +27,7 @@ A robust, generalized IoT platform for controlling PWM-driven devices (lights, p
 * **Solenoid / Latch (optional):** Any solenoid, electric strike, or relay driven through a logic-level MOSFET on the output pin, **with a flyback diode across the coil** (see [Solenoid Wiring & Flyback Diode](#solenoid-wiring--flyback-diode)). For active-low relay/driver boards, enable **Active-low output** in the Solenoid config.
 
 ### Pinout / Wiring
-* **I2C SDA / SCL:** Default ESP32 I2C pins -> ADS1115 SDA/SCL
+* **I2C SDA / SCL:** `GPIO 6` / `GPIO 7` (`i2cSdaPin` / `i2cSclPin`) -> ADS1115 SDA/SCL. Set explicitly because on the ESP32-C3/S3 the core's default SCL is GPIO 9, the button pin.
 * **ADS1115 A0:** Connected to the center of the 1/5th Voltage Divider measuring the battery.
 * **Output Pin:** `GPIO 4` (Configurable in code as `pwmPin`) — drives the dimmer, solenoid, or switch load depending on the selected Device Mode.
 * **Manual Button Pin:** `GPIO 9` (Configurable in code as `bootButtonPin`, wired to switch to GND). On the ESP32-S3/C3 this is the onboard BOOT button.
