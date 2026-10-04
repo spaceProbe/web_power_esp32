@@ -158,8 +158,12 @@ unsigned long lastButtonMillis = 0;
 const long debounceTime = 250; 
 
 // --- Device Constants & Variables ---
-const int pwmPin = 4;       
-const int bootButtonPin = 9; 
+const int pwmPin = 4;
+const int bootButtonPin = 9;
+// I2C to the ADS1115. Set explicitly: on the ESP32-C3/S3 the core's default SCL is GPIO9,
+// which is the button above. These match the Mechanitis ESP32 node board (IF-FW-PCB-01).
+const int i2cSdaPin = 6;
+const int i2cSclPin = 7;
 
 int currentPWM = 0;
 int pwmOveride = 0;      
@@ -719,6 +723,10 @@ void setup() {
     apActive = false;
   }
   
+  // Start I2C on the board's pins before the ADS1115 library calls Wire.begin() with defaults
+  // (a second begin() on a running bus keeps these pins).
+  Wire.begin(i2cSdaPin, i2cSclPin);
+
   if (batteryEnabled) {
     ads.setGain(GAIN_ONE);
     delay(200);
